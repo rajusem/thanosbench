@@ -6,6 +6,11 @@
 new-run/
 genblocks/
 *.yaml.bak
+gen-180day-flat/
+gen-3day-flat/
+new-run-3day/
+gen-180day.manifest.json
+thanos-object-storage.backup.*.yaml
 
 # Go workspace files
 vendor/
