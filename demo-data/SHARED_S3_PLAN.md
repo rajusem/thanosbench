@@ -2,6 +2,10 @@
 
 > Revised after 3-lens review (Architecture / PE / QE). All BLOCKER and MAJOR
 > findings addressed. See "Review findings" section at the bottom for traceability.
+>
+> **Status:** design only. `upload_to_s3.sh`, `load_from_s3.sh` and
+> `validate_s3_source.sh` are not built yet; the scripts that exist today are in
+> `demo-data/README.md`.
 
 ## Goal
 Generate right-sizing demo blocks once locally, store them in a shared AWS S3 bucket,
@@ -62,7 +66,11 @@ validate_s3_source.sh. All fields are required.
   "num_namespaces": 100,
   "num_workloads":  10,
   "num_pods":       3,
-  "series_per_block": 74418,
+  "series_per_block": 74418,          // right-sizing + filler series per block
+  "rs_series_per_block": 74418,
+  "filler_series_per_block": 0,       // NUM_EXTRA_METRICS x N + NUM_POD_METRICS x N x W x P
+  "num_extra_metrics": 0,             // recommended filler: 4 (+ num_pod_metrics 20 ->
+  "num_pod_metrics": 0,               //   60,400 filler, 134,818 series/block)
   "blocks_per_cluster": 234,
   "expected_blocks": 4680,
   "clusters": ["ac-test-man-1", ..., "ac-test-man-20"],  // exact list, 20 entries
@@ -188,7 +196,8 @@ download before trusting it.
 1. Cluster context: `EXPECTED_SERVER_SUBSTR` enforced as hard ABORT
 2. MCO retention: checks compactor StatefulSet args (then MCO CR fallback) — all three
    tiers must be ≥ `MIN_RETENTION_DAYS` (default 182). Inline from preflight_180day.sh.
-3. Consumer MinIO/S3 capacity: free space ≥ dataset size × 1.2
+3. Consumer MinIO/S3 capacity: free space ≥ dataset size × (1 + 3.8 + 1.1) × 1.2 — the
+   consumer's compactor keeps 5m (~3.8x) and 1h (~1.1x) downsampled copies next to the raw blocks
 4. Consumer LOCAL disk: `df` check — free space ≥ dataset size × 1.2 (download temp dir)
 5. Concurrency lock: `mkdir /tmp/load_from_s3_${EXPECTED_SERVER_SUBSTR}.lock 2>/dev/null`
    (POSIX atomic mkdir — works on macOS and Linux; `flock` is Linux-only). Abort if mkdir
@@ -333,6 +342,10 @@ CONSUMER (per team):
 | Consumer download egress (208 GB × $0.09/GB) | ~$19/team per load |
 | Generator upload | free (data-in to S3) |
 | MinIO PVC on consumer cluster | already provisioned |
+
+These figures are for data without filler. With the recommended filler
+(`NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4`) the dataset is ~0.5 TB, and each consumer
+hub holds ~5–6× that after its compactor downsamples it.
 
 ---
 

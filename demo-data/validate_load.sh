@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LOCAL ANALYSIS SCRIPT (untracked, do NOT commit). Read-only query-side validation
+# Demo-data ops script (see demo-data/README.md). Read-only query-side validation
 # of the uploaded right-sizing data through Thanos. Certification-grade:
 #   * queries the FULL data window (from the run-manifest), not just the last 3 days
 #   * ASSERTS (not just prints): per-level cardinality per cluster, memory byte-scale

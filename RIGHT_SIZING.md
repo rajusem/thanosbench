@@ -1,6 +1,6 @@
 # Thanosbench for Producing Thanos Blocks Metrics Data
 
-This guide provides step-by-step instructions for generating Thanos blocks metrics data using `thanosbench`. The example below demonstrates how to produce approximately one month of data in weekly increments.
+This guide provides step-by-step instructions for generating Thanos blocks metrics data using `thanosbench`. The scripts below produce 16 weeks (about four months) of data in weekly blocks, ending today. For the 180-day perf/scale dataset, use the `demo-data/` pipeline instead (see `demo-data/README.md`).
 
 ## Prerequisites
 
@@ -16,10 +16,12 @@ This guide provides step-by-step instructions for generating Thanos blocks metri
 1. Clone the `thanosbench` repository:
 
     ```bash
-    git clone https://github.com/dvandra/thanosbench/
+    git clone https://github.com/rajusem/thanosbench.git
+    cd thanosbench
+    git checkout fix/right-sizing-profile-refs   # until it is merged to master
     ```
 
-    - Use the `master` branch (default).
+    - The right-sizing profiles described below are not on the upstream `dvandra/thanosbench` `master`.
 
 2. Build `thanosbench`:
 
@@ -28,13 +30,21 @@ This guide provides step-by-step instructions for generating Thanos blocks metri
     ```
     If you modify the profile (e.g., changing the time ranges), you must rebuild `thanosbench` by running `make build` again to apply those changes.
 
+    On recent macOS, a binary built with Go 1.21 or 1.22 aborts with `dyld: missing LC_UUID load command`. Build with the system linker instead:
+
+    ```bash
+    GOTOOLCHAIN=go1.22.12 go build -ldflags=-linkmode=external -o thanosbench ./cmd/thanosbench
+    ```
+
 3. Run the following script to generate Thanos blocks:
 
     ```bash
     ./run_thanosbench.sh
     ```
 
-    **Note:** Profiles are defined in `pkg/blockgen/profiles.go`. The default profile is `custom-continous-1-week-workload-pod`, which generates one week of cluster, namespace, workload, and pod right-sizing metrics.
+    **Note:** Profiles are defined in `pkg/blockgen/profiles.go`. The default profile is `custom-continous-1-week-workload-pod`, which generates one week of cluster, namespace, workload, and pod right-sizing metrics per run; the script runs it for 16 weeks per cluster.
+
+    The script generates the `WEEKS` (default 16) weeks ending today (UTC); set `END_EPOCH` to pin the end date. Keep the data recent: blocks older than the hub's retention (MCO default 365d) are deleted by the compactor.
 
     Scale is controlled by environment variables (edit the defaults in the scripts, or override at run time):
 
@@ -78,12 +88,18 @@ The profiles are defined in `pkg/blockgen/profiles.go`:
 | `custom-continous-1-week-full` | cluster, namespace, **workload**, **pod** (`acm_rs:*`) | hierarchical (see below) |
 | `custom-continous-3-day-full` | cluster, namespace, **workload**, **pod** (`acm_rs:*`) | three-day hierarchical profile |
 
-Each `acm_rs*`/`acm_rs_vm*` metric is emitted once per right-sizing **profile**
-(`Max OverAll`, `P95`, `P99`) with `profile` as a per-series label — matching how
-the recording rules label real data, so the dashboards' `$profile` dropdown is
-populated. Because `profile` is now per-series, it must **not** be passed via
-`--labels` (only `cluster`/`aggregation` are block-level external labels).
+Except for `custom-continous-1-week-workload-pod`, each `acm_rs*`/`acm_rs_vm*`
+metric is emitted once per right-sizing **profile** (`Max OverAll`, `P95`, `P99`)
+with `profile` as a per-series label — matching how the recording rules label real
+data, so the dashboards' `$profile` dropdown is populated. Because `profile` is
+per-series, it must **not** be passed via `--labels`: an external `profile` label
+overwrites the series' own and folds P95/P99 into one profile.
 `kubevirt_*`/`extra_metric_*` filler carry no `profile` label.
+
+`custom-continous-1-week-workload-pod` emits a single copy of each metric, without
+`profile` and without `request_hard`. `run_thanosbench.sh` gives its blocks
+`profile="Max OverAll"` as an external label (and no other profile), so only that
+profile appears in the dashboards.
 
 | Metric | Breakdown labels (per series) | Series/block |
 | --- | --- | --- |
@@ -116,7 +132,11 @@ Each level carries the six measures `cpu_request`, `cpu_usage`,
 the namespace level adds `cpu_request_hard`/`memory_request_hard`. Every metric
 is emitted once per profile, `*_recommendation` tracks `*_usage × 1.10`, and pods
 nest under workloads (a pod's `workload`/`workload_type` labels match its
-parent). Generate blocks for it with:
+parent). Pod names are unique across namespaces and clusters and shaped like
+Deployment pods (`workload-3-<10-hex hash>-1`), so the `pod` label has one value
+per pod as in a real fleet. Pods don't churn: the same pods exist for the whole
+generated range, so long-range pod queries come out somewhat optimistic.
+Generate blocks for it with:
 
 ```bash
 ./run_thanosbench_full.sh "1,3"   # inclusive cluster range
@@ -125,7 +145,9 @@ parent). Generate blocks for it with:
 #### Environment variables (cardinality & values)
 
 All profiles read these (unset/empty uses the default; a non-empty but invalid
-value fails fast with an error):
+value fails fast with an error). These are the profiles' own defaults, used when you
+call `thanosbench block plan` directly; the `run_*.sh` scripts pass their own values
+(see the table in step 3):
 
 | Variable | Default | Applies to | Meaning |
 | --- | --- | --- | --- |
@@ -137,12 +159,34 @@ value fails fast with an error):
 | `NUM_NAMES` | `200` | `custom-continous-1-week[-vm]` | `name` dimension per namespace |
 | `NUM_WORKLOADS` | `10` | `-full` | workloads per namespace |
 | `NUM_PODS` | `20` | `-full` | pods per workload |
-| `NUM_EXTRA_METRICS` | `200` (`-full`: `0`) | all custom | synthetic `extra_metric_*` filler load |
+| `NUM_EXTRA_METRICS` | `200` (`-full`: `0`) | `custom-continous-1-week[-vm]`, `*-full` | synthetic `extra_metric_*` filler: per metric, one series per namespace (`*-full`) or per namespace × `NUM_NAMES` (`custom-continous-1-week[-vm]`) |
+| `NUM_POD_METRICS` | `0` | `-full` | synthetic `extra_pod_metric_*{container,namespace,pod}` filler, one series per pod per metric |
+
+The two filler knobs stand in for the other metrics a managed cluster sends to
+the hub (sampled every 5m, like the metrics collector). On a live hub
+(`local-cluster`, collected by MCOA) about 93% of the non-right-sizing series
+carry a `pod` label — roughly 20 series per pod plus 4 per namespace — so
+`NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4` reproduces the series count and the
+pod/namespace fan-out of a real cluster of the same shape (for 100 namespaces ×
+10 workloads × 3 pods: 60,400 filler series next to 74,418 right-sizing series).
+Real series carry more labels (uid, node, image, …), so the index is still
+somewhat smaller than on a real hub.
 
 To keep the process from running out of memory (blocks are built in memory before
 being flushed), each profile refuses to plan more than ~5,000,000 series per
 block and prints the projected series count to stderr. Lower the `NUM_*` values
 if you hit the cap.
+
+The cap is not a memory guard: memory grows with samples, and a filler series
+has 3× the samples of a right-sizing series. With the recommended filler
+(134,818 series/block) one cluster-week peaked at ~8.2 GB RSS (`block plan`
+3.6 GB + `block gen` 4.6 GB, which run together) and took ~90 s and ~0.92 GB of
+disk on a 10-core Mac. Memory grows roughly in proportion to `NUM_POD_METRICS`.
+
+On the hub, the compactor keeps downsampled copies next to the raw blocks. With
+samples every 5–15 minutes the 5m copy is ~3.8× the raw size (measured with
+Thanos v0.42.4) and the 1h copy ~0.85–1.1×, so object storage ends up holding
+about 5–6× the uploaded size.
 
 ### 2. Store Data Blocks in S3
 

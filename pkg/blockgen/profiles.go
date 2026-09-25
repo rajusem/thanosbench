@@ -3,6 +3,7 @@ package blockgen
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math/rand" // Import the rand package
 	"os"
 	"sort"
@@ -731,6 +732,9 @@ var rsMeasures = []string{
 	"memory_request", "memory_usage", "memory_recommendation",
 }
 
+// rsHardMeasures are the ResourceQuota ceilings emitted at the namespace level only.
+var rsHardMeasures = []string{"cpu_request_hard", "memory_request_hard"}
+
 // rightSizingLeveled generates ACM right-sizing gauges across four aggregation
 // levels — cluster, namespace, workload and pod — each carrying the per-level
 // breakdown labels the acm_rs recording rules / dashboards expect:
@@ -759,8 +763,15 @@ var rsMeasures = []string{
 //	workload:  NUM_NAMESPACES * NUM_WORKLOADS
 //	pod:       NUM_NAMESPACES * NUM_WORKLOADS * NUM_PODS
 //
-// An optional NUM_EXTRA_METRICS filler load (off by default for this profile) can
-// be layered on for cardinality/load testing.
+// Pod names are unique across namespaces and clusters and shaped like Deployment
+// pods (see podName), so the pod label has one distinct value per pod. Pods
+// don't churn: the same pods exist for the whole generated time range.
+//
+// Optional filler (off by default for this profile) stands in for the other
+// metrics a managed cluster sends, all sampled every 5m:
+//
+//	NUM_EXTRA_METRICS  extra_metric_N{namespace}                     one series per namespace
+//	NUM_POD_METRICS    extra_pod_metric_N{container,namespace,pod}   one series per pod
 func rightSizingLeveled(ranges []time.Duration) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
 
@@ -798,22 +809,40 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		if err != nil {
 			return err
 		}
+		numPodMetrics, err := getEnvInt("NUM_POD_METRICS", 0)
+		if err != nil {
+			return err
+		}
 
 		// namespace level additionally carries the ResourceQuota "hard limit"
 		// gauges (cpu/memory request_hard) the namespaces dashboard queries.
-		rsNamespaceMeasures := append(append([]string{}, rsMeasures...),
-			"cpu_request_hard", "memory_request_hard")
+		rsNamespaceMeasures := append(append([]string{}, rsMeasures...), rsHardMeasures...)
 
-		perMeasure := 1 + numNamespaces + numNamespaces*numWorkloads + numNamespaces*numWorkloads*numPods
-		// request_hard exists at the namespace level only.
-		namespaceHard := numNamespaces * (len(rsNamespaceMeasures) - len(rsMeasures))
-		// acm_rs series are emitted once per profile; filler is not.
-		projected := len(rsProfiles)*(len(rsMeasures)*perMeasure+namespaceHard) + numExtra*numNamespaces
-		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d filler) = %d series/block\n",
-			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, projected)
-		if projected > maxSeriesPerBlock {
-			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_EXTRA_METRICS", projected, maxSeriesPerBlock)
+		projected, fits := leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics)
+		count := ">" + strconv.Itoa(maxSeriesPerBlock)
+		if projected >= 0 {
+			count = strconv.Itoa(projected)
 		}
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d namespace filler, +%d pod filler) = %s series/block\n",
+			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, numPodMetrics, count)
+		if !fits {
+			return fmt.Errorf("projected %s series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_EXTRA_METRICS/NUM_POD_METRICS", count, maxSeriesPerBlock)
+		}
+
+		// Pod names are computed once (after the cap check) so the acm_rs:pod
+		// series and the per-pod filler share them, and every block of the plan
+		// uses the same names. The cluster block label makes them unique across
+		// clusters too.
+		cluster := extLset.Get("cluster")
+		podNames := make([]string, 0, numNamespaces*numWorkloads*numPods)
+		for ni := 0; ni < numNamespaces; ni++ {
+			for wi := 0; wi < numWorkloads; wi++ {
+				for pi := 0; pi < numPods; pi++ {
+					podNames = append(podNames, podName(cluster, fmt.Sprintf("namespace-%d", ni), fmt.Sprintf("workload-%d", wi), pi))
+				}
+			}
+		}
+		podAt := func(ni, wi, pi int) string { return podNames[(ni*numWorkloads+wi)*numPods+pi] }
 
 		randomJitter := rand.Intn(10) + 1
 		maxt := rangeForTimestamp(maxTime.PrometheusTimestamp(), durToMilis(2*time.Hour))
@@ -905,7 +934,7 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 						}
 
 						for pi := 0; pi < numPods; pi++ {
-							pod := fmt.Sprintf("%s-%d", wl, pi)
+							pod := podAt(ni, wi, pi)
 
 							for _, m := range rsMeasures {
 								// pod level (nested under its workload)
@@ -929,6 +958,27 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 					add(name, labels.Labels{
 						{Name: "namespace", Value: fmt.Sprintf("namespace-%d", ni)},
 					}, extraSpec)
+				}
+			}
+
+			// Optional per-pod filler (NUM_POD_METRICS), one series per pod per
+			// metric, on the same pods as the acm_rs:pod series. Real clusters send
+			// most of their other series per pod/container (kube_pod_*, container_*),
+			// so this reproduces that index shape — many distinct pod values — and
+			// not just the series count.
+			for e := 1; e <= numPodMetrics; e++ {
+				name := fmt.Sprintf("extra_pod_metric_%d", e)
+				for ni := 0; ni < numNamespaces; ni++ {
+					ns := fmt.Sprintf("namespace-%d", ni)
+					for wi := 0; wi < numWorkloads; wi++ {
+						for pi := 0; pi < numPods; pi++ {
+							add(name, labels.Labels{
+								{Name: "container", Value: "app"},
+								{Name: "namespace", Value: ns},
+								{Name: "pod", Value: podAt(ni, wi, pi)},
+							}, extraSpec)
+						}
+					}
 				}
 			}
 
@@ -969,6 +1019,44 @@ var workloadTypes = []string{"deployment", "statefulset", "daemonset"}
 
 func workloadTypeFor(index int) string {
 	return workloadTypes[index%len(workloadTypes)]
+}
+
+// podName returns the name of pod pi of workload wl in namespace ns of the given
+// cluster, shaped like a Deployment pod: <workload>-<10-hex pod-template
+// hash>-<ordinal>. The hash comes from cluster/ns/wl, so names don't repeat
+// across namespaces or clusters (as in a real fleet), and it is deterministic,
+// so a pod keeps its name in every block and every run. Pods never churn.
+func podName(cluster, ns, wl string, pi int) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(cluster + "/" + ns + "/" + wl))
+	return fmt.Sprintf("%s-%010x-%d", wl, h.Sum64()>>24, pi)
+}
+
+// leveledSeriesPerBlock returns how many series rightSizingLeveled emits per
+// block and whether that fits maxSeriesPerBlock. Each product is bounded before
+// it is formed, so absurd inputs report "doesn't fit" (with -1) instead of
+// overflowing past the cap.
+func leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics int) (int, bool) {
+	nsWl, ok1 := boundedMul(maxSeriesPerBlock, numNamespaces, numWorkloads)
+	pods, ok2 := boundedMul(maxSeriesPerBlock, nsWl, numPods)
+	podFiller, ok3 := boundedMul(maxSeriesPerBlock, numPodMetrics, pods)
+	nsFiller, ok4 := boundedMul(maxSeriesPerBlock, numExtra, numNamespaces)
+	// Each of these alone already means more series than the cap.
+	if !ok1 || !ok2 || !ok3 || !ok4 || numNamespaces > maxSeriesPerBlock {
+		return -1, false
+	}
+	// acm_rs series are emitted once per profile; request_hard exists at the
+	// namespace level only; filler has no profile label.
+	n := len(rsProfiles)*(len(rsMeasures)*(1+numNamespaces+nsWl+pods)+len(rsHardMeasures)*numNamespaces) + nsFiller + podFiller
+	return n, n <= maxSeriesPerBlock
+}
+
+// boundedMul returns a*b for non-negative a and b, or false if it exceeds limit.
+func boundedMul(limit, a, b int) (int, bool) {
+	if a != 0 && b > limit/a {
+		return 0, false
+	}
+	return a * b, true
 }
 
 // rsDimensionSets returns one label set per series for a right-sizing metric.

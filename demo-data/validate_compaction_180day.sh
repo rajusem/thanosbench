@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LOCAL ANALYSIS SCRIPT (untracked, do NOT commit). Run it yourself:
+# Demo-data ops script (see demo-data/README.md). Run it yourself:
 #   ! bash validate_compaction_180day.sh                 # report + fail on real problems
 #   ! REQUIRE_SETTLED=1 bash validate_compaction_180day.sh  # also require compaction/5m/1h done
 #

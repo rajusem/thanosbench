@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LOCAL ANALYSIS SCRIPT (untracked, do NOT commit). Run it yourself:
+# Demo-data ops script (see demo-data/README.md). Run it yourself:
 #   ! bash upload_180day_batched.sh              # generate first, and run preflight
 #   ! RESUME=1   bash upload_180day_batched.sh   # resume a dropped upload (no delete)
 #   ! TEARDOWN=1 bash upload_180day_batched.sh   # label-scoped delete of demo data only
@@ -33,6 +33,10 @@ RESTART_STORE="${RESTART_STORE:-rolling}"     # rolling | all | none
 STAGE_PAUSE_SEC="${STAGE_PAUSE_SEC:-0}"       # pause between per-cluster stages (let compaction catch up)
 SKIP_CAPACITY_CHECK="${SKIP_CAPACITY_CHECK:-0}"
 CAP_MARGIN="${CAP_MARGIN:-1.2}"
+# the compactor keeps 5m and 1h downsampled copies next to the raw blocks
+# (5m ~3.8x raw, measured with Thanos v0.42.4 on this data; 1h ~0.85-1.1x)
+DS_5M_RATIO="${DS_5M_RATIO:-3.8}"
+DS_1H_RATIO="${DS_1H_RATIO:-1.1}"
 WATCH_COMPACTOR="${WATCH_COMPACTOR:-1}"
 LOCAL_PORT="${LOCAL_PORT:-$(( 20000 + RANDOM % 20000 ))}"
 
@@ -193,14 +197,15 @@ echo "  validated ${NEW_COUNT} blocks"
 if [[ "${SKIP_CAPACITY_CHECK}" != "1" ]]; then
   echo "== MinIO free-capacity check =="
   LOCAL_BYTES=$(( $(du -sk "${SRC}" | awk '{print $1}') * 1024 ))
-  NEED=$(python3 -c "print(int(${LOCAL_BYTES}*${CAP_MARGIN}))")
+  NEED=$(python3 -c "print(int(${LOCAL_BYTES}*(1+${DS_5M_RATIO}+${DS_1H_RATIO})*${CAP_MARGIN}))")
   MPOD="$(oc get pods -n "${NS}" -o name | grep -iE 'minio' | grep -viE 'setup|job' | head -1 || true)"
   if [[ -n "${MPOD}" ]]; then
     DF="$(oc exec -n "${NS}" "${MPOD}" -- df -Pk 2>/dev/null || true)"
     FREEB=$(printf '%s\n' "${DF}" | awk 'NR>1 && $6 !~ /^\/(proc|sys|dev|etc|run|$)/ {print $4*1024}' | sort -rn | head -1)
     if [[ -n "${FREEB:-}" ]]; then
-      echo "  upload ~$(python3 -c "print('%.1f'%(${LOCAL_BYTES}/1e9))") GB; MinIO free ~$(python3 -c "print('%.1f'%(${FREEB}/1e9))") GB (need ~$(python3 -c "print('%.1f'%(${NEED}/1e9))") GB)"
-      [[ "${FREEB}" -ge "${NEED}" ]] || { echo "ABORT: insufficient MinIO capacity (set SKIP_CAPACITY_CHECK=1 to override)." >&2; exit 5; }
+      echo "  upload ~$(python3 -c "print('%.1f'%(${LOCAL_BYTES}/1e9))") GB; MinIO free ~$(python3 -c "print('%.1f'%(${FREEB}/1e9))") GB (need ~$(python3 -c "print('%.1f'%(${NEED}/1e9))") GB incl. 5m/1h downsampled copies)"
+      python3 -c "import sys; sys.exit(0 if ${FREEB} >= ${NEED} else 1)" 2>/dev/null \
+        || { echo "ABORT: insufficient MinIO capacity (set SKIP_CAPACITY_CHECK=1 to override)." >&2; exit 5; }
     else
       echo "  ⚠️  could not parse MinIO df; skipping (verify manually or SKIP_CAPACITY_CHECK=1)"
     fi

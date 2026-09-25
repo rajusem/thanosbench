@@ -5,6 +5,9 @@
 #
 # Optional: pass a cluster index range as the first argument (used by run_parallel.sh):
 #   ./run_thanosbench.sh 1,5
+#
+# Generates WEEKS (default 16) weekly blocks ending today (UTC); set END_EPOCH to pin
+# the end date.
 
 # Scale (defaults: 10 clusters, 100 namespaces, 10 workloads, 3 pods per workload)
 NUM_CLUSTERS="${NUM_CLUSTERS:-10}"
@@ -25,7 +28,23 @@ else
   end=$NUM_CLUSTERS
 fi
 
-MAX_TIMES=("2024-12-07T00:00:00Z" "2024-12-14T00:00:00Z" "2024-12-21T00:00:00Z" "2024-12-28T00:00:00Z" "2025-01-04T00:00:00Z" "2025-01-11T00:00:00Z" "2025-01-18T00:00:00Z" "2025-01-25T00:00:00Z" "2025-02-01T00:00:00Z" "2025-02-08T00:00:00Z" "2025-02-15T00:00:00Z" "2025-02-22T00:00:00Z" "2025-03-01T00:00:00Z" "2025-03-08T00:00:00Z" "2025-03-15T00:00:00Z" "2025-03-22T00:00:00Z")
+# Weekly --max-time values: the WEEKS weeks ending at END_EPOCH (default: today
+# 00:00 UTC), oldest first. Keeping the data recent keeps it inside the hub's
+# retention (MCO default 365d); older blocks are deleted by the compactor.
+WEEKS="${WEEKS:-16}"
+END_EPOCH="${END_EPOCH:-$(( ( $(date -u +%s) / 86400 ) * 86400 ))}"
+iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+MAX_TIMES=()
+for (( w = WEEKS - 1; w >= 0; w-- )); do MAX_TIMES+=("$(iso $(( END_EPOCH - w * 7 * 86400 )))"); done
+
+# custom-continous-1-week-workload-pod has no per-series `profile` label, so its
+# blocks get one as an external label for the dashboards' $profile filter. The
+# other right-sizing profiles emit `profile` per series; an external `profile`
+# would overwrite it and fold P95/P99 into "Max OverAll", so it is not set for them.
+PROFILE_LABEL=()
+if [ "$PROFILE" = "custom-continous-1-week-workload-pod" ]; then
+  PROFILE_LABEL=(--labels "profile=\"Max OverAll\"")
+fi
 
 random_in_range() {
   local min=$1
@@ -57,7 +76,7 @@ for ((cluster = start; cluster <= end; cluster++)); do
         --labels "resource=\"cpu\"" \
         --labels "clusterType=\"bench\"" \
         --labels "mode=\"idle\"" \
-        --labels "profile=\"Max OverAll\"" \
+        ${PROFILE_LABEL[@]+"${PROFILE_LABEL[@]}"} \
         --max-time "$MAX_TIME" \
         | ./thanosbench block gen --output.dir "$OUTPUT_DIR" --workers 20
     done

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LOCAL OPS SCRIPT (untracked, do NOT commit). Run it yourself:
+# Demo-data ops script (see demo-data/README.md). Run it yourself:
 #   ! bash expand_minio_pvc.sh
 #
 # Replaces MinIO's emptyDir volume with a 500 Gi gp3-csi PVC so the

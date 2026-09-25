@@ -1,8 +1,13 @@
 # 180-Day Right-Sizing Demo Data Pipeline — Process & Review Findings
 
-> **Status:** local operational doc (untracked). NOT part of the upstream PR — it
-> documents cluster-specific demo-data tooling that reads secrets and targets a
-> named hub cluster, which must never be committed.
+> **Status:** operational doc for the `demo-data/` scripts, committed with them. The
+> scripts store no credentials: they read the object-store secret from the cluster at
+> run time and refuse to run unless `EXPECTED_SERVER_SUBSTR` matches the logged-in hub.
+>
+> **Update 2026-09-25:** the profile now has realistic filler (`NUM_POD_METRICS=20
+> NUM_EXTRA_METRICS=4` → 134,818 series/block for N=100/W=10/P=3) and unique pod
+> names; preflight/upload size capacity for the downsampled copies too. Numbers in
+> §3/§4 marked "without filler" predate this; see the notes under each section.
 >
 > **Scope:** generate synthetic ACM right-sizing data (trial or full 180-day), load
 > it into a shared ACM MultiClusterObservability (MCO) hub's Thanos/MinIO backstore,
@@ -69,8 +74,12 @@ Correctness properties we rely on (all confirmed by the Thanos-expert review):
   **`0` raw / `300000` 5m / `3600000` 1h**.
 - `recommendation = usage × 1.10` **survives downsampling** — constant scaling commutes
   with the min/max/sum/count aggregates, so the ratio holds at every tier.
-- Our raw cadence is **15 min**, coarser than the 5m bucket, so 5m downsampling barely
-  reduces point count; the 1h tier gives the real ~4× reduction.
+- Our raw cadence is **15 min** (filler: 5 min), no finer than the 5m bucket, so 5m
+  downsampling doesn't reduce the point count at all, and every point is stored as 5
+  aggregates (count/sum/min/max/counter). The 5m copy is therefore **~3.8× larger** than
+  raw (measured with Thanos v0.42.4: a 248 MB 48h block became 945 MB), and the 1h copy
+  is about the raw size (~0.85–1.1×). Downsampling only saves space for data scraped
+  faster than every 5 min; here the hub ends up holding **~5.9× the upload**.
 
 ### Two corrections to earlier assumptions (important)
 1. **Consistency-delay keys off ULID mint time, not data age.** The compactor's
@@ -101,6 +110,11 @@ Series/block = `3 profiles × (6 measures × (1 + N + N·W + N·W·P) + 2N)`.
 | **Small** (validated) | 20 / 5 / 10 | 20,298 | 3 clusters × 234 | ~10 GB |
 | **Full** (default driver) | 40 / 10 / 20 | 152,178 | 3 clusters × 234 | ~79 GB |
 
+The table is **without filler**. With the recommended filler (`NUM_POD_METRICS=20
+NUM_EXTRA_METRICS=4`, N=100/W=10/P=3) a block has 134,818 series and one cluster-week
+measured ~0.92 GB, so 20 clusters × 26 weeks is ~0.5 TB to upload and ~3 TB on the hub
+after downsampling.
+
 Both produce **702 blocks** (9 blocks/week × 26 weeks × 3 clusters) over 182 days —
 block *count* is time-driven, not cardinality-driven. `custom-continous-1-week-full`
 spans exactly **168h**, so stepping `--max-time` by 7 days tiles cleanly (only ~15-min
@@ -120,6 +134,11 @@ throughput** (~10–40 MB/s) and the **shared compactor's** speed.
 | Raw queryable (store-gw sync) | ~2–5 min | ~5–15 min | index-header load |
 | Compaction + 5m + 1h settle | **~1h measured** (all 20 clusters, all tiers) | ~2–6 h | single compactor, 3× rewrite |
 
+The rows above are **without filler**. With the recommended filler, generation measured
+~90 s per cluster-week (~13 h for 20 clusters × 26 weeks, ~8.2 GB RAM peak), and the
+compactor has ~89B samples to downsample for the full run (estimated 5–8 h at the
+3–5M samples/s measured locally).
+
 **Measured on jdj64 (2026-09-24):** 20-cluster trial, 74,418 series/block, ~44 MB/block.
 Compaction completed aggressively: 452/568 blocks deletion-marked within ~1h of upload,
 all clusters reached levels 4–7, 331.7h largest span, raw+5m+1h confirmed.
@@ -132,7 +151,7 @@ compactor settles. Compaction itself starts ~30 min post-upload (consistency-del
 
 ## 5. The scripts
 
-All are **local, untracked** ops scripts. Credentials are always read in-place from
+All are operator-run ops scripts. Credentials are always read in-place from
 the `thanos-object-storage` secret and **never printed**. A **run-manifest**
 (`gen-180day.manifest.json`) written by the generator is the single source of truth
 (base epoch, weeks, clusters, cardinality, expected counts) that the later stages read.
@@ -235,10 +254,10 @@ in minutes · 168h weekly tiling avoids overlaps · no replica/dedup needed · 5
 - **Credentials never printed** — read in-place from the secret; the permission
   classifier blocks direct reads of `thanos-object-storage`.
 - **Blast radius contained** — the pipeline only ever deletes blocks whose external
-  `cluster` label is a demo cluster (`ac-test-man-1/2/3`), never real tenant data, and
-  aborts if it cannot prove the demo set is clean.
-- **Nothing committed** — all pipeline scripts and this doc are untracked working-tree
-  files, separate from the upstream PR (which is code-only: profiles/blockgen/tests/docs).
+  `cluster` label is one of the demo clusters in the run-manifest (`ac-test-man-*`),
+  never real tenant data, and aborts if it cannot prove the demo set is clean.
+- **No secrets in git** — the scripts and this doc are committed, but no credentials,
+  kubeconfigs, generated blocks or run-manifests are (see `.gitignore`).
 
 ---
 
@@ -250,7 +269,12 @@ in minutes · 168h weekly tiling avoids overlaps · no replica/dedup needed · 5
 - **Port-forward at 79 GB** is the slow, drop-prone link. Resumable (`RESUME=1`), but the
   faster long-term path is an **in-cluster Job** (generate + push over the cluster network),
   which is designed but not yet built (needs a thanosbench image).
-- **Data ages out** — timestamps are pinned to wall-clock at generation; even at 182d
-  retention the oldest blocks drop off ~182 days after generation. Regenerate to refresh.
+- **Data ages out** — timestamps are pinned to wall-clock at generation. The oldest week
+  ends ~175 days before generation, so with MCO's default 365d retention it is deleted
+  ~190 days after generation (only ~7 days at the 182d minimum). Regenerate to refresh.
+- **No pod churn** — the same pods exist for all 180 days (real pods get new names on
+  every rollout), so long-range pod-level queries come out somewhat optimistic.
+- **Filler is thinner than real metrics** — it matches the series count and the
+  pod/namespace fan-out, but real series carry more labels (uid, node, image, …).
 - **`workload_type` casing** (PascalCase) still pending confirmation against the ACM
   dashboard's expected values (tracked as an open PR question, unrelated to this pipeline).

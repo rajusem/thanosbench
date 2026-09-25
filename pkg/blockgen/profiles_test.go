@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +131,7 @@ func TestRightSizingLeveledCardinality(t *testing.T) {
 	t.Setenv("NUM_WORKLOADS", "2")
 	t.Setenv("NUM_PODS", "4")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
+	t.Setenv("NUM_POD_METRICS", "0")
 
 	const (
 		ns  = 3
@@ -175,6 +177,7 @@ func TestRightSizingLeveledLabels(t *testing.T) {
 	t.Setenv("NUM_WORKLOADS", "1")
 	t.Setenv("NUM_PODS", "1")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
+	t.Setenv("NUM_POD_METRICS", "0")
 
 	blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
 
@@ -224,6 +227,7 @@ func TestRightSizingLeveledCapErrors(t *testing.T) {
 	t.Setenv("NUM_NAMESPACES", "1000")
 	t.Setenv("NUM_WORKLOADS", "1000")
 	t.Setenv("NUM_PODS", "1000")
+	t.Setenv("NUM_POD_METRICS", "0")
 
 	err := rightSizingLeveled([]time.Duration{2 * time.Hour})(
 		context.Background(), fixedMaxTime(t), labels.Labels{}, func(BlockSpec) error {
@@ -247,6 +251,218 @@ func TestRightSizingLeveledInvalidEnv(t *testing.T) {
 		})
 	if err == nil {
 		t.Fatal("expected error for invalid NUM_WORKLOADS, got nil")
+	}
+}
+
+// planWithCluster runs a PlanFn with a `cluster` block label, as the demo scripts do.
+func planWithCluster(t *testing.T, fn PlanFn, cluster string) []BlockSpec {
+	t.Helper()
+	var blocks []BlockSpec
+	err := fn(context.Background(), fixedMaxTime(t), labels.FromStrings("cluster", cluster), func(b BlockSpec) error {
+		blocks = append(blocks, b)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("plan returned error: %v", err)
+	}
+	return blocks
+}
+
+// podPairs returns the (namespace, pod) pairs of the series named name.
+func podPairs(b BlockSpec, name string) map[[2]string]bool {
+	out := map[[2]string]bool{}
+	for _, s := range b.Series {
+		if s.Labels.Get("__name__") == name {
+			out[[2]string{s.Labels.Get("namespace"), s.Labels.Get("pod")}] = true
+		}
+	}
+	return out
+}
+
+func equalSets[K comparable](a, b map[K]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// cancelledCtx makes a plan stop with context.Canceled at its first block, so a
+// broken cap check fails a test quickly instead of building millions of series.
+func cancelledCtx() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+// TestPodNameGolden pins podName's output (expected values computed separately
+// with FNV-1a 64), so any change to the naming, such as a per-run salt, fails.
+func TestPodNameGolden(t *testing.T) {
+	for _, tc := range []struct {
+		cluster, ns, wl string
+		pi              int
+		want            string
+	}{
+		{"ac-test-man-1", "namespace-0", "workload-0", 0, "workload-0-69399f19bc-0"},
+		{"ac-test-man-2", "namespace-0", "workload-0", 0, "workload-0-3b1c769042-0"},
+		{"", "namespace-3", "workload-7", 2, "workload-7-5df624374f-2"},
+	} {
+		if got := podName(tc.cluster, tc.ns, tc.wl, tc.pi); got != tc.want {
+			t.Errorf("podName(%q, %q, %q, %d) = %q, want %q", tc.cluster, tc.ns, tc.wl, tc.pi, got, tc.want)
+		}
+	}
+}
+
+// TestRightSizingLeveledPodNamesUnique checks there is one distinct pod name per
+// pod, that pods nest under their workload, that names are stable across blocks
+// and across separate runs (generate_180day.sh runs one plan per week), and that
+// another cluster gets different names.
+func TestRightSizingLeveledPodNamesUnique(t *testing.T) {
+	t.Setenv("NUM_NAMESPACES", "3")
+	t.Setenv("NUM_WORKLOADS", "2")
+	t.Setenv("NUM_PODS", "4")
+	t.Setenv("NUM_EXTRA_METRICS", "0")
+	t.Setenv("NUM_POD_METRICS", "0")
+	const pods = 3 * 2 * 4
+
+	plan := func(cluster string) []BlockSpec {
+		return planWithCluster(t, rightSizingLeveled([]time.Duration{2 * time.Hour, 2 * time.Hour}), cluster)
+	}
+	run1, run2, other := plan("ac-test-man-1"), plan("ac-test-man-1"), plan("ac-test-man-2")
+
+	names := func(b BlockSpec) map[string]bool {
+		out := map[string]bool{}
+		for pair := range podPairs(b, "acm_rs:pod:cpu_usage") {
+			out[pair[1]] = true
+		}
+		return out
+	}
+	first := names(run1[0])
+	if len(first) != pods {
+		t.Fatalf("got %d distinct pod names, want %d (one per pod)", len(first), pods)
+	}
+	for _, s := range run1[0].Series {
+		if s.Labels.Get("__name__") == "acm_rs:pod:cpu_usage" && !strings.HasPrefix(s.Labels.Get("pod"), s.Labels.Get("workload")+"-") {
+			t.Errorf("pod %q does not nest under its workload %q", s.Labels.Get("pod"), s.Labels.Get("workload"))
+		}
+	}
+	if !equalSets(names(run1[1]), first) {
+		t.Error("pod names differ between blocks of one run")
+	}
+	if !equalSets(names(run2[0]), first) {
+		t.Error("pod names differ between two runs for the same cluster")
+	}
+	for pod := range names(other[0]) {
+		if first[pod] {
+			t.Errorf("pod name %q repeats in another cluster", pod)
+		}
+	}
+}
+
+// TestRightSizingLeveledPodFiller verifies NUM_POD_METRICS emits one series per
+// pod per filler metric, on exactly the (namespace, pod) pairs of acm_rs:pod,
+// without a profile label.
+func TestRightSizingLeveledPodFiller(t *testing.T) {
+	t.Setenv("NUM_NAMESPACES", "2")
+	t.Setenv("NUM_WORKLOADS", "2")
+	t.Setenv("NUM_PODS", "3")
+	t.Setenv("NUM_EXTRA_METRICS", "1")
+	t.Setenv("NUM_POD_METRICS", "2")
+
+	blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
+	counts := countByName(blocks[0])
+
+	const pods = 2 * 2 * 3
+	for _, name := range []string{"extra_pod_metric_1", "extra_pod_metric_2"} {
+		if got := counts[name]; got != pods {
+			t.Errorf("%s: got %d series, want %d (one per pod)", name, got, pods)
+		}
+	}
+	if got := counts["extra_pod_metric_3"]; got != 0 {
+		t.Errorf("extra_pod_metric_3 should not exist with NUM_POD_METRICS=2, got %d", got)
+	}
+	if got := counts["extra_metric_1"]; got != 2 {
+		t.Errorf("extra_metric_1: got %d series, want 2 (one per namespace)", got)
+	}
+
+	rsPairs := podPairs(blocks[0], "acm_rs:pod:cpu_usage")
+	if len(rsPairs) != pods {
+		t.Fatalf("acm_rs:pod has %d (namespace, pod) pairs, want %d", len(rsPairs), pods)
+	}
+	for _, name := range []string{"extra_pod_metric_1", "extra_pod_metric_2"} {
+		if !equalSets(podPairs(blocks[0], name), rsPairs) {
+			t.Errorf("%s: (namespace, pod) pairs differ from acm_rs:pod", name)
+		}
+	}
+	for _, s := range blocks[0].Series {
+		name := s.Labels.Get("__name__")
+		if !strings.HasPrefix(name, "extra_pod_metric_") {
+			continue
+		}
+		if got, want := breakdownNames(s.Labels), []string{"container", "namespace", "pod"}; !equalStrings(got, want) {
+			t.Errorf("%s: got breakdown labels %v, want %v", name, got, want)
+		}
+		if !labelsSorted(s.Labels) {
+			t.Errorf("%s: labels not sorted: %v", name, s.Labels)
+		}
+		if s.Characteristics.ScrapeInterval != 5*time.Minute {
+			t.Errorf("%s: scrape interval %v, want 5m", name, s.Characteristics.ScrapeInterval)
+		}
+	}
+}
+
+// TestLeveledSeriesPerBlockMatchesEmitted checks the projected count, which the
+// cap and the demo scripts' sizing rely on, equals what a plan really emits.
+func TestLeveledSeriesPerBlockMatchesEmitted(t *testing.T) {
+	for _, c := range []struct{ ns, wl, pods, extra, podMetrics int }{
+		{1, 1, 1, 0, 0}, {3, 2, 4, 0, 0}, {3, 2, 4, 2, 3}, {2, 0, 5, 1, 1}, {0, 3, 3, 4, 4},
+	} {
+		t.Run(fmt.Sprintf("ns=%d,wl=%d,pods=%d,extra=%d,podMetrics=%d", c.ns, c.wl, c.pods, c.extra, c.podMetrics), func(t *testing.T) {
+			t.Setenv("NUM_NAMESPACES", strconv.Itoa(c.ns))
+			t.Setenv("NUM_WORKLOADS", strconv.Itoa(c.wl))
+			t.Setenv("NUM_PODS", strconv.Itoa(c.pods))
+			t.Setenv("NUM_EXTRA_METRICS", strconv.Itoa(c.extra))
+			t.Setenv("NUM_POD_METRICS", strconv.Itoa(c.podMetrics))
+
+			want, fits := leveledSeriesPerBlock(c.ns, c.wl, c.pods, c.extra, c.podMetrics)
+			if !fits {
+				t.Fatal("small config reported as over the cap")
+			}
+			blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
+			if got := len(blocks[0].Series); got != want {
+				t.Errorf("emitted %d series, projected %d", got, want)
+			}
+		})
+	}
+}
+
+// TestRightSizingLeveledPodFillerCountsTowardCap ensures the per-pod filler is
+// counted in the series cap, including values whose product would overflow int.
+func TestRightSizingLeveledPodFillerCountsTowardCap(t *testing.T) {
+	t.Setenv("NUM_NAMESPACES", "10")
+	t.Setenv("NUM_WORKLOADS", "10")
+	t.Setenv("NUM_PODS", "30")
+	t.Setenv("NUM_EXTRA_METRICS", "0")
+	for _, tc := range []struct{ name, podMetrics string }{
+		{"6M filler series", "2000"}, // 2000 x 3000 pods
+		// x 3000 pods wraps int64 to 2384, which an unbounded product would accept.
+		{"overflowing product", "6148914691236518"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NUM_POD_METRICS", tc.podMetrics)
+			err := rightSizingLeveled([]time.Duration{2 * time.Hour})(
+				cancelledCtx(), fixedMaxTime(t), labels.Labels{}, func(BlockSpec) error {
+					t.Fatal("blockEncoder must not be called when the cap is exceeded")
+					return nil
+				})
+			if err == nil || !strings.Contains(err.Error(), "exceeds cap") {
+				t.Fatalf("want a series-cap error, got %v", err)
+			}
+		})
 	}
 }
 
@@ -358,6 +574,7 @@ func TestRecommendationDerivation(t *testing.T) {
 	t.Setenv("NUM_WORKLOADS", "1")
 	t.Setenv("NUM_PODS", "1")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
+	t.Setenv("NUM_POD_METRICS", "0")
 
 	blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
 
@@ -394,6 +611,7 @@ func TestMemoryMetricByteScale(t *testing.T) {
 	t.Setenv("NUM_WORKLOADS", "1")
 	t.Setenv("NUM_PODS", "1")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
+	t.Setenv("NUM_POD_METRICS", "0")
 	t.Setenv("MIN_GAUGE", "2")
 	t.Setenv("MAX_GAUGE", "8")
 	t.Setenv("MEM_MIN_GAUGE", "1000000000") // 1 GB
