@@ -168,11 +168,13 @@ the hub (sampled every 5m, like the metrics collector). Of the ~260 names in the
 ACM allowlist a cluster sends ~100–135 (only those that exist on it), and on a
 live hub (3 clusters collected by MCOA) ~15 per-pod names make ~90% of those
 series: about 18 series per pod, 3 per namespace, and one or a few per cluster or
-node for the other ~80–110 names. So `NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4
-NUM_CLUSTER_METRICS=120` reproduces a VM-heavy cluster's series count, its
-pod/namespace fan-out and its metric-name count (for 100 namespaces × 10
-workloads × 3 pods: 60,520 filler series next to 74,418 right-sizing series,
-~144 metric names). The per-pod value is slightly high on purpose: it covers the
+node for the other ~80–110 names. So `NUM_POD_METRICS=20 NUM_CLUSTER_METRICS=124`
+reproduces a VM-heavy cluster's series count, its pod fan-out and its metric-name
+count (for 100 namespaces × 10 workloads × 3 pods: 60,124 filler series next to
+74,418 right-sizing series, ~144 metric names). The few per-namespace-only series
+of a real cluster (~3 per namespace) are folded into the cluster-level count to
+keep one knob; `NUM_EXTRA_METRICS` still works for the `-full` profiles if that
+shape is wanted. The per-pod value is slightly high on purpose: it covers the
 node-level series (~300 per node) that the model does not scale with nodes. Real
 series carry more labels (uid, node, image, …), so the index is still somewhat
 smaller than on a real hub.

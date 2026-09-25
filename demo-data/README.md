@@ -67,14 +67,14 @@ Exit codes for validators: **0 = pass, 1 = data problem, 2 = environment/not-rea
 export EXPECTED_SERVER_SUBSTR="<your-cluster-substring>"
 
 # 1. GENERATE — writes blocks to ./gen-180day-flat/ + gen-180day.manifest.json
-#    CLUSTERS defaults to 3 clusters; set it for more. NUM_POD_METRICS/NUM_EXTRA_METRICS/
-#    NUM_CLUSTER_METRICS add filler for the other metrics a real cluster sends (see RIGHT_SIZING.md).
+#    CLUSTERS defaults to 3 clusters; set it for more. NUM_POD_METRICS and NUM_CLUSTER_METRICS
+#    add filler for the other metrics a real cluster sends (see RIGHT_SIZING.md).
 #    The settings are passed with `env` instead of `export`, so they can't leak into
 #    other scripts (e.g. run_parallel.sh) run later in the same shell.
 #    Needs ~8.2 GB RAM; ~90 s and ~0.92 GB of disk per cluster-week.
 #    20 clusters = category 1; use 100 or 300 for categories 2 and 3.
 GEN_ENV=(CLUSTERS="$(seq -f 'ac-test-man-%g' 1 20 | tr '\n' ' ')"
-         NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=3 NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4 NUM_CLUSTER_METRICS=120)
+         NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=3 NUM_POD_METRICS=20 NUM_CLUSTER_METRICS=124)
 
 #    Trial (20 clusters × 2 weeks; ~1h, ~40 GB):
 env "${GEN_ENV[@]}" WEEKS=2 bash generate_180day.sh
