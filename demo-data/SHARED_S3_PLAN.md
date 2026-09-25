@@ -68,9 +68,10 @@ validate_s3_source.sh. All fields are required.
   "num_pods":       3,
   "series_per_block": 74418,          // right-sizing + filler series per block
   "rs_series_per_block": 74418,
-  "filler_series_per_block": 0,       // NUM_EXTRA_METRICS x N + NUM_POD_METRICS x N x W x P
-  "num_extra_metrics": 0,             // recommended filler: 4 (+ num_pod_metrics 20 ->
-  "num_pod_metrics": 0,               //   60,400 filler, 134,818 series/block)
+  "filler_series_per_block": 0,       // NUM_EXTRA_METRICS x N + NUM_POD_METRICS x N x W x P + NUM_CLUSTER_METRICS
+  "num_extra_metrics": 0,             // recommended filler: 4 / 20 / 120 ->
+  "num_pod_metrics": 0,               //   60,520 filler, 134,938 series/block
+  "num_cluster_metrics": 0,
   "blocks_per_cluster": 234,
   "expected_blocks": 4680,
   "clusters": ["ac-test-man-1", ..., "ac-test-man-20"],  // exact list, 20 entries
@@ -344,7 +345,7 @@ CONSUMER (per team):
 | MinIO PVC on consumer cluster | already provisioned |
 
 These figures are for data without filler. With the recommended filler
-(`NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4`) the dataset is ~0.5 TB, and each consumer
+(`NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4 NUM_CLUSTER_METRICS=120`) the dataset is ~0.5 TB, and each consumer
 hub holds ~5–6× that after its compactor downsamples it.
 
 ---

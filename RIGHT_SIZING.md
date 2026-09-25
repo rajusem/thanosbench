@@ -161,16 +161,21 @@ call `thanosbench block plan` directly; the `run_*.sh` scripts pass their own va
 | `NUM_PODS` | `20` | `-full` | pods per workload |
 | `NUM_EXTRA_METRICS` | `200` (`-full`: `0`) | `custom-continous-1-week[-vm]`, `*-full` | synthetic `extra_metric_*` filler: per metric, one series per namespace (`*-full`) or per namespace × `NUM_NAMES` (`custom-continous-1-week[-vm]`) |
 | `NUM_POD_METRICS` | `0` | `-full` | synthetic `extra_pod_metric_*{container,namespace,pod}` filler, one series per pod per metric |
+| `NUM_CLUSTER_METRICS` | `0` | `-full` | synthetic `extra_cluster_metric_*` filler, one series per cluster per metric |
 
-The two filler knobs stand in for the other metrics a managed cluster sends to
-the hub (sampled every 5m, like the metrics collector). On a live hub
-(`local-cluster`, collected by MCOA) about 93% of the non-right-sizing series
-carry a `pod` label — roughly 20 series per pod plus 4 per namespace — so
-`NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4` reproduces the series count and the
-pod/namespace fan-out of a real cluster of the same shape (for 100 namespaces ×
-10 workloads × 3 pods: 60,400 filler series next to 74,418 right-sizing series).
-Real series carry more labels (uid, node, image, …), so the index is still
-somewhat smaller than on a real hub.
+The three filler knobs stand in for the other metrics a managed cluster sends to
+the hub (sampled every 5m, like the metrics collector). Of the ~260 names in the
+ACM allowlist a cluster sends ~100–135 (only those that exist on it), and on a
+live hub (3 clusters collected by MCOA) ~15 per-pod names make ~90% of those
+series: about 18 series per pod, 3 per namespace, and one or a few per cluster or
+node for the other ~80–110 names. So `NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4
+NUM_CLUSTER_METRICS=120` reproduces a VM-heavy cluster's series count, its
+pod/namespace fan-out and its metric-name count (for 100 namespaces × 10
+workloads × 3 pods: 60,520 filler series next to 74,418 right-sizing series,
+~144 metric names). The per-pod value is slightly high on purpose: it covers the
+node-level series (~300 per node) that the model does not scale with nodes. Real
+series carry more labels (uid, node, image, …), so the index is still somewhat
+smaller than on a real hub.
 
 To keep the process from running out of memory (blocks are built in memory before
 being flushed), each profile refuses to plan more than ~5,000,000 series per
@@ -179,7 +184,7 @@ if you hit the cap.
 
 The cap is not a memory guard: memory grows with samples, and a filler series
 has 3× the samples of a right-sizing series. With the recommended filler
-(134,818 series/block) one cluster-week peaked at ~8.2 GB RSS (`block plan`
+(~135k series/block) one cluster-week peaked at ~8.2 GB RSS (`block plan`
 3.6 GB + `block gen` 4.6 GB, which run together) and took ~90 s and ~0.92 GB of
 disk on a 10-core Mac. Memory grows roughly in proportion to `NUM_POD_METRICS`.
 

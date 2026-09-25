@@ -30,6 +30,7 @@ NUM_WORKLOADS=10    # workloads per namespace
 NUM_PODS=20         # pods per workload (pods nest under their workload)
 NUM_EXTRA_METRICS=0 # optional synthetic filler load; 0 keeps blocks lean
 NUM_POD_METRICS=0   # optional per-pod filler; pinned so an exported value can't leak in
+NUM_CLUSTER_METRICS=0 # optional cluster-level filler; pinned for the same reason
 
 # Weekly --max-time values: the WEEKS weeks ending at END_EPOCH (default: today
 # 00:00 UTC), oldest first. Keeping the data recent keeps it inside the hub's
@@ -66,7 +67,7 @@ for ((cluster = start; cluster <= end; cluster++)); do
       # is emitted per-series by the profile (Max OverAll/P95/P99), so it must
       # NOT be passed via --labels here.
       NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
-        NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
+        NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
         ./thanosbench block plan -p "$PROFILE" \
         --labels "cluster=\"ac-test-man-${cluster}\"" \
         --labels "aggregation=\"1d\"" \

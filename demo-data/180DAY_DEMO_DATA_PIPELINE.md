@@ -5,7 +5,7 @@
 > run time and refuse to run unless `EXPECTED_SERVER_SUBSTR` matches the logged-in hub.
 >
 > **Update 2026-09-25:** the profile now has realistic filler (`NUM_POD_METRICS=20
-> NUM_EXTRA_METRICS=4` → 134,818 series/block for N=100/W=10/P=3) and unique pod
+> NUM_EXTRA_METRICS=4 NUM_CLUSTER_METRICS=120` → 134,938 series/block for N=100/W=10/P=3) and unique pod
 > names; preflight/upload size capacity for the downsampled copies too. Numbers in
 > §3/§4 marked "without filler" predate this; see the notes under each section.
 >
@@ -111,7 +111,7 @@ Series/block = `3 profiles × (6 measures × (1 + N + N·W + N·W·P) + 2N)`.
 | **Full** (default driver) | 40 / 10 / 20 | 152,178 | 3 clusters × 234 | ~79 GB |
 
 The table is **without filler**. With the recommended filler (`NUM_POD_METRICS=20
-NUM_EXTRA_METRICS=4`, N=100/W=10/P=3) a block has 134,818 series and one cluster-week
+NUM_EXTRA_METRICS=4 NUM_CLUSTER_METRICS=120`, N=100/W=10/P=3) a block has 134,938 series and one cluster-week
 measured ~0.92 GB, so 20 clusters × 26 weeks is ~0.5 TB to upload and ~3 TB on the hub
 after downsampling.
 

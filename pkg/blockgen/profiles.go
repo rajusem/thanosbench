@@ -770,8 +770,9 @@ var rsHardMeasures = []string{"cpu_request_hard", "memory_request_hard"}
 // Optional filler (off by default for this profile) stands in for the other
 // metrics a managed cluster sends, all sampled every 5m:
 //
-//	NUM_EXTRA_METRICS  extra_metric_N{namespace}                     one series per namespace
-//	NUM_POD_METRICS    extra_pod_metric_N{container,namespace,pod}   one series per pod
+//	NUM_EXTRA_METRICS    extra_metric_N{namespace}                     one series per namespace
+//	NUM_POD_METRICS      extra_pod_metric_N{container,namespace,pod}   one series per pod
+//	NUM_CLUSTER_METRICS  extra_cluster_metric_N                        one series per cluster
 func rightSizingLeveled(ranges []time.Duration) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
 
@@ -813,20 +814,24 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		if err != nil {
 			return err
 		}
+		numClusterMetrics, err := getEnvInt("NUM_CLUSTER_METRICS", 0)
+		if err != nil {
+			return err
+		}
 
 		// namespace level additionally carries the ResourceQuota "hard limit"
 		// gauges (cpu/memory request_hard) the namespaces dashboard queries.
 		rsNamespaceMeasures := append(append([]string{}, rsMeasures...), rsHardMeasures...)
 
-		projected, fits := leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics)
+		projected, fits := leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics, numClusterMetrics)
 		count := ">" + strconv.Itoa(maxSeriesPerBlock)
 		if projected >= 0 {
 			count = strconv.Itoa(projected)
 		}
-		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d namespace filler, +%d pod filler) = %s series/block\n",
-			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, numPodMetrics, count)
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d namespace filler, +%d pod filler, +%d cluster filler) = %s series/block\n",
+			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, numPodMetrics, numClusterMetrics, count)
 		if !fits {
-			return fmt.Errorf("projected %s series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_EXTRA_METRICS/NUM_POD_METRICS", count, maxSeriesPerBlock)
+			return fmt.Errorf("projected %s series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_EXTRA_METRICS/NUM_POD_METRICS/NUM_CLUSTER_METRICS", count, maxSeriesPerBlock)
 		}
 
 		// Pod names are computed once (after the cap check) so the acm_rs:pod
@@ -982,6 +987,15 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 				}
 			}
 
+			// Optional cluster-level filler (NUM_CLUSTER_METRICS), one series per
+			// metric; cluster identity comes from the block labels. Most allowlisted
+			// metric names are cluster/node-level and add only one or a few series
+			// each, so this reproduces a real cluster's metric-name count without
+			// adding meaningful load.
+			for e := 1; e <= numClusterMetrics; e++ {
+				add(fmt.Sprintf("extra_cluster_metric_%d", e), nil, extraSpec)
+			}
+
 			if err := blockEncoder(b); err != nil {
 				return err
 			}
@@ -1036,18 +1050,18 @@ func podName(cluster, ns, wl string, pi int) string {
 // block and whether that fits maxSeriesPerBlock. Each product is bounded before
 // it is formed, so absurd inputs report "doesn't fit" (with -1) instead of
 // overflowing past the cap.
-func leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics int) (int, bool) {
+func leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics, numClusterMetrics int) (int, bool) {
 	nsWl, ok1 := boundedMul(maxSeriesPerBlock, numNamespaces, numWorkloads)
 	pods, ok2 := boundedMul(maxSeriesPerBlock, nsWl, numPods)
 	podFiller, ok3 := boundedMul(maxSeriesPerBlock, numPodMetrics, pods)
 	nsFiller, ok4 := boundedMul(maxSeriesPerBlock, numExtra, numNamespaces)
 	// Each of these alone already means more series than the cap.
-	if !ok1 || !ok2 || !ok3 || !ok4 || numNamespaces > maxSeriesPerBlock {
+	if !ok1 || !ok2 || !ok3 || !ok4 || numNamespaces > maxSeriesPerBlock || numClusterMetrics > maxSeriesPerBlock {
 		return -1, false
 	}
 	// acm_rs series are emitted once per profile; request_hard exists at the
 	// namespace level only; filler has no profile label.
-	n := len(rsProfiles)*(len(rsMeasures)*(1+numNamespaces+nsWl+pods)+len(rsHardMeasures)*numNamespaces) + nsFiller + podFiller
+	n := len(rsProfiles)*(len(rsMeasures)*(1+numNamespaces+nsWl+pods)+len(rsHardMeasures)*numNamespaces) + nsFiller + podFiller + numClusterMetrics
 	return n, n <= maxSeriesPerBlock
 }
 

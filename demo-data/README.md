@@ -49,7 +49,7 @@ ABORT: EXPECTED_SERVER_SUBSTR is empty
 
 | Script | Role | Key env vars |
 |---|---|---|
-| `generate_180day.sh` | Generate blocks to local disk + write run-manifest | `CLUSTERS`, `NUM_NAMESPACES`, `NUM_WORKLOADS`, `NUM_PODS`, `NUM_POD_METRICS`, `NUM_EXTRA_METRICS`, `WEEKS`, `FORCE`, `DRY_RUN`, `OUT` |
+| `generate_180day.sh` | Generate blocks to local disk + write run-manifest | `CLUSTERS`, `NUM_NAMESPACES`, `NUM_WORKLOADS`, `NUM_PODS`, `NUM_POD_METRICS`, `NUM_EXTRA_METRICS`, `NUM_CLUSTER_METRICS`, `WEEKS`, `FORCE`, `DRY_RUN`, `OUT` |
 | `preflight_180day.sh` | READ-ONLY go/no-go checks (retention, capacity, compactor) | `MIN_RETENTION_DAYS` (182), `CAP_MARGIN` |
 | `expand_minio_pvc.sh` | One-time: replace MinIO emptyDir → 500Gi gp3-csi PVC | `PVC_SIZE` (500Gi) |
 | `upload_180day_batched.sh` | Upload local blocks → MinIO + trigger store-gw resync | `RESUME`, `TEARDOWN`, `RESTART_STORE`, `STAGE_PAUSE_SEC`, `PARALLEL` |
@@ -67,14 +67,14 @@ Exit codes for validators: **0 = pass, 1 = data problem, 2 = environment/not-rea
 export EXPECTED_SERVER_SUBSTR="<your-cluster-substring>"
 
 # 1. GENERATE — writes blocks to ./gen-180day-flat/ + gen-180day.manifest.json
-#    CLUSTERS defaults to 3 clusters; set it for more. NUM_POD_METRICS/NUM_EXTRA_METRICS
-#    add filler for the other metrics a real cluster sends (see RIGHT_SIZING.md).
+#    CLUSTERS defaults to 3 clusters; set it for more. NUM_POD_METRICS/NUM_EXTRA_METRICS/
+#    NUM_CLUSTER_METRICS add filler for the other metrics a real cluster sends (see RIGHT_SIZING.md).
 #    The settings are passed with `env` instead of `export`, so they can't leak into
 #    other scripts (e.g. run_parallel.sh) run later in the same shell.
 #    Needs ~8.2 GB RAM; ~90 s and ~0.92 GB of disk per cluster-week.
 #    20 clusters = category 1; use 100 or 300 for categories 2 and 3.
 GEN_ENV=(CLUSTERS="$(seq -f 'ac-test-man-%g' 1 20 | tr '\n' ' ')"
-         NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=3 NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4)
+         NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=3 NUM_POD_METRICS=20 NUM_EXTRA_METRICS=4 NUM_CLUSTER_METRICS=120)
 
 #    Trial (20 clusters × 2 weeks; ~1h, ~40 GB):
 env "${GEN_ENV[@]}" WEEKS=2 bash generate_180day.sh

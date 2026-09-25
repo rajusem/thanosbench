@@ -132,6 +132,7 @@ func TestRightSizingLeveledCardinality(t *testing.T) {
 	t.Setenv("NUM_PODS", "4")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
 	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
 
 	const (
 		ns  = 3
@@ -178,6 +179,7 @@ func TestRightSizingLeveledLabels(t *testing.T) {
 	t.Setenv("NUM_PODS", "1")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
 	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
 
 	blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
 
@@ -228,6 +230,7 @@ func TestRightSizingLeveledCapErrors(t *testing.T) {
 	t.Setenv("NUM_WORKLOADS", "1000")
 	t.Setenv("NUM_PODS", "1000")
 	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
 
 	err := rightSizingLeveled([]time.Duration{2 * time.Hour})(
 		context.Background(), fixedMaxTime(t), labels.Labels{}, func(BlockSpec) error {
@@ -327,6 +330,7 @@ func TestRightSizingLeveledPodNamesUnique(t *testing.T) {
 	t.Setenv("NUM_PODS", "4")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
 	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
 	const pods = 3 * 2 * 4
 
 	plan := func(cluster string) []BlockSpec {
@@ -372,9 +376,29 @@ func TestRightSizingLeveledPodFiller(t *testing.T) {
 	t.Setenv("NUM_PODS", "3")
 	t.Setenv("NUM_EXTRA_METRICS", "1")
 	t.Setenv("NUM_POD_METRICS", "2")
+	t.Setenv("NUM_CLUSTER_METRICS", "3")
 
 	blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
 	counts := countByName(blocks[0])
+
+	for _, name := range []string{"extra_cluster_metric_1", "extra_cluster_metric_2", "extra_cluster_metric_3"} {
+		if got := counts[name]; got != 1 {
+			t.Errorf("%s: got %d series, want 1 (one per cluster)", name, got)
+		}
+	}
+	if got := counts["extra_cluster_metric_4"]; got != 0 {
+		t.Errorf("extra_cluster_metric_4 should not exist with NUM_CLUSTER_METRICS=3, got %d", got)
+	}
+	for _, s := range blocks[0].Series {
+		if name := s.Labels.Get("__name__"); strings.HasPrefix(name, "extra_cluster_metric_") {
+			if got := breakdownNames(s.Labels); len(got) != 0 {
+				t.Errorf("%s: got breakdown labels %v, want none", name, got)
+			}
+			if s.Characteristics.ScrapeInterval != 5*time.Minute {
+				t.Errorf("%s: scrape interval %v, want 5m", name, s.Characteristics.ScrapeInterval)
+			}
+		}
+	}
 
 	const pods = 2 * 2 * 3
 	for _, name := range []string{"extra_pod_metric_1", "extra_pod_metric_2"} {
@@ -418,17 +442,18 @@ func TestRightSizingLeveledPodFiller(t *testing.T) {
 // TestLeveledSeriesPerBlockMatchesEmitted checks the projected count, which the
 // cap and the demo scripts' sizing rely on, equals what a plan really emits.
 func TestLeveledSeriesPerBlockMatchesEmitted(t *testing.T) {
-	for _, c := range []struct{ ns, wl, pods, extra, podMetrics int }{
-		{1, 1, 1, 0, 0}, {3, 2, 4, 0, 0}, {3, 2, 4, 2, 3}, {2, 0, 5, 1, 1}, {0, 3, 3, 4, 4},
+	for _, c := range []struct{ ns, wl, pods, extra, podMetrics, clusterMetrics int }{
+		{1, 1, 1, 0, 0, 0}, {3, 2, 4, 0, 0, 0}, {3, 2, 4, 2, 3, 5}, {2, 0, 5, 1, 1, 1}, {0, 3, 3, 4, 4, 7},
 	} {
-		t.Run(fmt.Sprintf("ns=%d,wl=%d,pods=%d,extra=%d,podMetrics=%d", c.ns, c.wl, c.pods, c.extra, c.podMetrics), func(t *testing.T) {
+		t.Run(fmt.Sprintf("ns=%d,wl=%d,pods=%d,extra=%d,podMetrics=%d,clusterMetrics=%d", c.ns, c.wl, c.pods, c.extra, c.podMetrics, c.clusterMetrics), func(t *testing.T) {
 			t.Setenv("NUM_NAMESPACES", strconv.Itoa(c.ns))
 			t.Setenv("NUM_WORKLOADS", strconv.Itoa(c.wl))
 			t.Setenv("NUM_PODS", strconv.Itoa(c.pods))
 			t.Setenv("NUM_EXTRA_METRICS", strconv.Itoa(c.extra))
 			t.Setenv("NUM_POD_METRICS", strconv.Itoa(c.podMetrics))
+			t.Setenv("NUM_CLUSTER_METRICS", strconv.Itoa(c.clusterMetrics))
 
-			want, fits := leveledSeriesPerBlock(c.ns, c.wl, c.pods, c.extra, c.podMetrics)
+			want, fits := leveledSeriesPerBlock(c.ns, c.wl, c.pods, c.extra, c.podMetrics, c.clusterMetrics)
 			if !fits {
 				t.Fatal("small config reported as over the cap")
 			}
@@ -575,6 +600,7 @@ func TestRecommendationDerivation(t *testing.T) {
 	t.Setenv("NUM_PODS", "1")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
 	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
 
 	blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
 
@@ -612,6 +638,7 @@ func TestMemoryMetricByteScale(t *testing.T) {
 	t.Setenv("NUM_PODS", "1")
 	t.Setenv("NUM_EXTRA_METRICS", "0")
 	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
 	t.Setenv("MIN_GAUGE", "2")
 	t.Setenv("MAX_GAUGE", "8")
 	t.Setenv("MEM_MIN_GAUGE", "1000000000") // 1 GB

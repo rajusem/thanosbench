@@ -47,6 +47,7 @@ NUM_WORKLOADS="${NUM_WORKLOADS:-5}"
 NUM_PODS="${NUM_PODS:-10}"
 NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}"   # filler: one series per namespace per metric
 NUM_POD_METRICS="${NUM_POD_METRICS:-0}"       # filler: one series per pod per metric
+NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-0}" # filler: one series per cluster per metric
 
 # Pin the anchor and floor to a UTC day boundary (stable across re-runs; aligns
 # block boundaries with the compactor's epoch-aligned planning windows).
@@ -54,13 +55,13 @@ BASE_EPOCH="${BASE_EPOCH:-$(( ( $(date -u +%s) / 86400 ) * 86400 ))}"
 DRY_RUN="${DRY_RUN:-0}"
 
 # every sizing knob must be a plain non-negative integer (no sign, no leading zero)
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 1; }
 done
 
 fmt() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
 rs_series_per_block() { python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print(3*(6*(1+N+N*W+N*W*P)+2*N))"; }
-filler_series_per_block() { python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print($NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P)"; }
+filler_series_per_block() { python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print($NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P+$NUM_CLUSTER_METRICS)"; }
 
 NCL=$(printf '%s\n' $CLUSTERS | grep -c .)
 RS_SPB=$(rs_series_per_block)
@@ -78,7 +79,7 @@ echo "  profile:      ${PROFILE} (168h, ${BLOCKS_PER_WEEK} blocks/week)"
 echo "  clusters:     ${NCL} (${CLUSTERS})"
 echo "  weeks:        ${WEEKS} (~$(( WEEKS*7 )) days)"
 echo "  cardinality:  N=${NUM_NAMESPACES} W=${NUM_WORKLOADS} P=${NUM_PODS} -> ${RS_SPB} right-sizing series/block"
-echo "  filler:       NUM_EXTRA_METRICS=${NUM_EXTRA_METRICS} NUM_POD_METRICS=${NUM_POD_METRICS} -> ${FILLER_SPB} series/block (total ${SPB})"
+echo "  filler:       NUM_EXTRA_METRICS=${NUM_EXTRA_METRICS} NUM_POD_METRICS=${NUM_POD_METRICS} NUM_CLUSTER_METRICS=${NUM_CLUSTER_METRICS} -> ${FILLER_SPB} series/block (total ${SPB})"
 echo "  total blocks: ${BLOCKS} (${PER_CLUSTER}/cluster)"
 echo "  window:       $(fmt "$(( BASE_EPOCH - (WEEKS)*7*86400 ))") .. $(fmt "$BASE_EPOCH") (pinned, day-aligned)"
 echo "  projected:    ~${PROJ_GB} GB on disk and to upload; ~${HUB_GB} GB on the hub after downsampling (raw + 5m + 1h)"
@@ -119,7 +120,7 @@ for cluster in $CLUSTERS; do
     BEFORE=$(find "$OUT" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')
     echo "  [${cluster}] week ${w}/${WEEKS} max-time=${MAX_TIME} gauge=[${MIN_GAUGE},${MAX_GAUGE}]"
     NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
-      NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
+      NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
       ./thanosbench block plan -p "$PROFILE" \
         --labels "cluster=\"${cluster}\"" --labels "aggregation=\"1d\"" \
         --max-time "$MAX_TIME" \
@@ -143,7 +144,7 @@ json.dump({
   "num_namespaces": $NUM_NAMESPACES, "num_workloads": $NUM_WORKLOADS, "num_pods": $NUM_PODS,
   "series_per_block": $SPB,
   "rs_series_per_block": $RS_SPB, "filler_series_per_block": $FILLER_SPB,
-  "num_extra_metrics": $NUM_EXTRA_METRICS, "num_pod_metrics": $NUM_POD_METRICS,
+  "num_extra_metrics": $NUM_EXTRA_METRICS, "num_pod_metrics": $NUM_POD_METRICS, "num_cluster_metrics": $NUM_CLUSTER_METRICS,
   "blocks_per_cluster": $PER_CLUSTER, "expected_blocks": $BLOCKS,
   "profile": "$PROFILE",
   "expected_server_substr": "$EXPECTED_SERVER_SUBSTR",

@@ -31,6 +31,7 @@ NUM_WORKLOADS="${NUM_WORKLOADS:-10}"
 NUM_PODS="${NUM_PODS:-20}"
 NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}"
 NUM_POD_METRICS="${NUM_POD_METRICS:-0}"
+NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-0}"
 CLUSTER_COUNT="${CLUSTER_COUNT:-3}"
 # before generation there is no manifest yet: size for CLUSTERS if it is set
 # shellcheck disable=SC2086  # split the space-separated cluster list on purpose
@@ -60,7 +61,7 @@ except Exception as e:
     sys.exit("cannot read manifest: %s" % e)
 # a wrong type or a negative value must stop the run, not size it as zero
 for key, default in (("weeks",26),("num_namespaces",40),("num_workloads",10),("num_pods",20),
-                     ("num_extra_metrics",0),("num_pod_metrics",0)):
+                     ("num_extra_metrics",0),("num_pod_metrics",0),("num_cluster_metrics",0)):
     v = m.get(key, default)
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
         sys.exit("manifest field %s=%r is not a non-negative integer" % (key, v))
@@ -79,7 +80,7 @@ PY
 fi
 
 # sizing inputs (from env or manifest) must be plain non-negative integers
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS CLUSTER_COUNT; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS CLUSTER_COUNT; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 2; }
 done
 
@@ -93,7 +94,7 @@ if [[ "${SERVER}" == *"${EXPECTED_SERVER_SUBSTR}"* ]]; then ok "on expected clus
 PROJ_BYTES=$(python3 -c "
 N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;C=$CLUSTER_COUNT;WK=$WEEKS
 rs=3*(6*(1+N+N*W+N*W*P)+2*N)
-filler=$NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P
+filler=$NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P+$NUM_CLUSTER_METRICS
 # right-sizing series sample every 15m (96/day), filler every 5m (288/day)
 print(int((rs*96*$BYTES_PER_SAMPLE+filler*288*$FILLER_BYTES_PER_SAMPLE)*(WK*7)*C))")
 PROJ_GB=$(python3 -c "print('%.1f'%($PROJ_BYTES/1e9))")
@@ -106,7 +107,7 @@ else
 fi
 HUB_BYTES=$(python3 -c "print(int(${PROJ_BYTES}*${DS_FACTOR}))")
 HUB_GB=$(python3 -c "print('%.1f'%(${HUB_BYTES}/1e9))")
-echo "== projected upload size: ~${PROJ_GB} GB (N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS, filler ns=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS, ${WEEKS}w x ${CLUSTER_COUNT} clusters) =="
+echo "== projected upload size: ~${PROJ_GB} GB (N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS, filler ns=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS cluster=$NUM_CLUSTER_METRICS, ${WEEKS}w x ${CLUSTER_COUNT} clusters) =="
 echo "== on the hub after compaction/downsampling: ~${HUB_GB} GB (x${DS_FACTOR}: ${DS_NOTE}) =="
 
 echo "== 2. MCO retention (need all tiers >= ${MIN_RETENTION_DAYS}d) =="
