@@ -445,6 +445,25 @@ func getEnvFloat(key string, def float64) (float64, error) {
 	return f, nil
 }
 
+// getEnvDuration mirrors getEnvInt for duration-valued environment variables
+// (e.g. RS_SCRAPE_INTERVAL). Unset/empty yields the default; a value that is
+// present but not a Go duration string ("15m", "1h", "24h") or that is not
+// positive is a fatal error rather than a silent fallback.
+func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s=%q: must be a duration such as 15m, 1h or 24h: %w", key, v, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be > 0", key, v)
+	}
+	return d, nil
+}
+
 func realisticK8s(ranges []time.Duration, rolloutInterval time.Duration, apps int, metricsPerApp int) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
 
@@ -767,8 +786,15 @@ var rsHardMeasures = []string{"cpu_request_hard", "memory_request_hard"}
 // pods (see podName), so the pod label has one distinct value per pod. Pods
 // don't churn: the same pods exist for the whole generated time range.
 //
+// Every acm_rs series is sampled every RS_SCRAPE_INTERVAL (default 15m; 24h
+// matches the daily recording rules). seriesgen places a block's samples at
+// mint + k*interval for k >= 1, so a block shorter than the interval still
+// holds one sample per series, but that sample lands one interval after the
+// block's planned start, i.e. past its planned end (see RIGHT_SIZING.md).
+//
 // Optional filler (off by default for this profile) stands in for the other
-// metrics a managed cluster sends, all sampled every 5m:
+// metrics a managed cluster sends, all sampled every 5m regardless of
+// RS_SCRAPE_INTERVAL:
 //
 //	NUM_EXTRA_METRICS    extra_metric_N{namespace}                     one series per namespace
 //	NUM_POD_METRICS      extra_pod_metric_N{container,namespace,pod}   one series per pod
@@ -818,6 +844,26 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		if err != nil {
 			return err
 		}
+		// RS_SCRAPE_INTERVAL is the sample interval of the acm_rs:* series. The ACM
+		// right-sizing recording rules evaluate once a day, so 24h is the realistic
+		// cadence; the 15m default is kept so existing runs are unchanged. The
+		// filler keeps its own 5m interval regardless.
+		rsScrapeInterval, err := getEnvDuration("RS_SCRAPE_INTERVAL", 15*time.Minute)
+		if err != nil {
+			return err
+		}
+		// The generator writes a series' samples at mint+interval, mint+2*interval,
+		// ... up to the first multiple of the interval that reaches the block's
+		// maxt. When the interval divides the block length that overshoot is 1 ms;
+		// otherwise the last sample lands up to one interval past maxt, inside the
+		// next block's time range, and (as the 5m filler starts the next block
+		// earlier) the blocks overlap and the compactor halts. Verified with
+		// 45m and 1h30m. Refuse such intervals instead of producing bad data.
+		for _, r := range ranges {
+			if r%rsScrapeInterval != 0 {
+				return fmt.Errorf("RS_SCRAPE_INTERVAL=%s must divide every block length of the profile (%v), e.g. 15m, 30m, 1h or 2h: otherwise a block's last sample lands past its end, blocks overlap and the compactor halts", rsScrapeInterval, ranges)
+			}
+		}
 
 		// namespace level additionally carries the ResourceQuota "hard limit"
 		// gauges (cpu/memory request_hard) the namespaces dashboard queries.
@@ -828,8 +874,8 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		if projected >= 0 {
 			count = strconv.Itoa(projected)
 		}
-		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d namespace filler, +%d pod filler, +%d cluster filler) = %s series/block\n",
-			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, numPodMetrics, numClusterMetrics, count)
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d namespace filler, +%d pod filler, +%d cluster filler) = %s series/block, acm_rs sample interval %s\n",
+			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, numPodMetrics, numClusterMetrics, count, rsScrapeInterval)
 		if !fits {
 			return fmt.Errorf("projected %s series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_EXTRA_METRICS/NUM_POD_METRICS/NUM_CLUSTER_METRICS", count, maxSeriesPerBlock)
 		}
@@ -859,7 +905,7 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 				Max:            maxGauge,
 				Min:            minGauge,
 				Jitter:         float64(randomJitter),
-				ScrapeInterval: 15 * time.Minute,
+				ScrapeInterval: rsScrapeInterval,
 				ChangeInterval: 10 * time.Minute,
 			},
 		}

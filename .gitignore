@@ -22,3 +22,4 @@ vendor/
 .idea/
 encoded_thanos*.txt
 test
+gen-work*/

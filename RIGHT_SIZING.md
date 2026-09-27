@@ -162,16 +162,17 @@ call `thanosbench block plan` directly; the `run_*.sh` scripts pass their own va
 | `NUM_EXTRA_METRICS` | `200` (`-full`: `0`) | `custom-continous-1-week[-vm]`, `*-full` | synthetic `extra_metric_*` filler: per metric, one series per namespace (`*-full`) or per namespace × `NUM_NAMES` (`custom-continous-1-week[-vm]`) |
 | `NUM_POD_METRICS` | `0` | `-full` | synthetic `extra_pod_metric_*{container,namespace,pod}` filler, one series per pod per metric |
 | `NUM_CLUSTER_METRICS` | `0` | `-full` | synthetic `extra_cluster_metric_*` filler, one series per cluster per metric |
+| `RS_SCRAPE_INTERVAL` | `15m` | `-full` | sample interval of the `acm_rs:*` series, as a Go duration that divides every block length of the profile (2h, 8h, 48h): `15m`, `30m`, `1h` or `2h`; the filler stays at 5m. The real ACM right-sizing recording rules evaluate once a day, so the default is ~96× denser than production and long-range right-sizing queries scan more points than they would on a real hub (a pessimistic test). Other values are refused: the generator writes a block's samples at multiples of the interval from the block start, so an interval that does not divide the block length puts the last sample past the block's end, makes blocks overlap and halts the compactor (observed with 45m, 1h30m and 24h on Thanos v0.42.4). A true 1-sample/day cadence needs a generator change first. |
 
 The three filler knobs stand in for the other metrics a managed cluster sends to
 the hub (sampled every 5m, like the metrics collector). Of the ~260 names in the
 ACM allowlist a cluster sends ~100–135 (only those that exist on it), and on a
 live hub (3 clusters collected by MCOA) ~15 per-pod names make ~90% of those
 series: about 18 series per pod, 3 per namespace, and one or a few per cluster or
-node for the other ~80–110 names. So `NUM_POD_METRICS=20 NUM_CLUSTER_METRICS=124`
+node for the other ~80–110 names. So `NUM_POD_METRICS=20 NUM_CLUSTER_METRICS=154`
 reproduces a VM-heavy cluster's series count, its pod fan-out and its metric-name
-count (for 100 namespaces × 10 workloads × 3 pods: 60,124 filler series next to
-74,418 right-sizing series, ~144 metric names). The few per-namespace-only series
+count (for 100 namespaces × 10 workloads × 3 pods: 60,154 filler series next to
+74,418 right-sizing series, ~174 metric names). The few per-namespace-only series
 of a real cluster (~3 per namespace) are folded into the cluster-level count to
 keep one knob; `NUM_EXTRA_METRICS` still works for the `-full` profiles if that
 shape is wanted. The per-pod value is slightly high on purpose: it covers the

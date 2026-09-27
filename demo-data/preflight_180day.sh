@@ -7,10 +7,15 @@
 # if wrong, either waste the whole run or disrupt real tenants:
 #   1. correct cluster context
 #   2. MCO retention >= 182d for raw AND 5m AND 1h (else compactor deletes it by maxTime)
-#   3. MinIO free capacity >= ~1.3x projected upload size (else ENOSPC on shared bucket)
+#   3. MinIO free capacity >= ~1.3x projected upload size (else ENOSPC on shared bucket);
+#      skipped when the hub's object store is AWS S3 (no fixed capacity to run out of)
 #   4. compactor not already halted, and downsampling enabled
 #   5. store-gateway shard memory headroom (best effort)
 #   6. compactor scratch PVC size vs per-group working set (best effort)
+#
+# The object store (bucket, optional prefix, endpoint) is read from the thanos-object-storage
+# Secret (thanos.yaml): a *.amazonaws.com endpoint = mode s3, anything else = in-cluster
+# MinIO. The detected mode is printed after the cluster-context check.
 #
 # Reads the run manifest written by generate_180day.sh for sizing; falls back to
 # env/defaults if absent. Credentials are never printed.
@@ -45,6 +50,7 @@ FAIL=0
 warn() { echo "  ⚠️  $*"; }
 bad()  { echo "  ❌ $*"; FAIL=1; }
 ok()   { echo "  ✅ $*"; }
+trim() { sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'\''//; s/'\''$//'; }
 
 [[ -n "${EXPECTED_SERVER_SUBSTR}" ]] || { echo "ABORT: EXPECTED_SERVER_SUBSTR is empty (guard disabled)." >&2; exit 2; }
 
@@ -89,6 +95,29 @@ SERVER="$(oc whoami --show-server 2>/dev/null || true)"
 echo "  user:   $(oc whoami 2>/dev/null || echo '?')"
 echo "  server: ${SERVER:-<not logged in>}"
 if [[ "${SERVER}" == *"${EXPECTED_SERVER_SUBSTR}"* ]]; then ok "on expected cluster"; else bad "server does not contain '${EXPECTED_SERVER_SUBSTR}'"; fi
+
+# --- object store: bucket / prefix / endpoint from the Thanos objstore config in the MCO
+# secret. Only those fields are parsed; the creds in the same YAML are never printed.
+SECRET="thanos-object-storage"; KEY="thanos.yaml"
+OBJ_CFG="$(oc get secret "${SECRET}" -n "${NS}" -o jsonpath="{.data.${KEY//./\\.}}" 2>/dev/null | base64 -d 2>/dev/null || true)"
+cfg_val() { printf '%s\n' "${OBJ_CFG}" | grep -E "^[[:space:]]*$1:" | head -1 | sed -E "s/^[[:space:]]*$1:[[:space:]]*//" | trim; }
+OBJ_BUCKET="$(cfg_val bucket)"; OBJ_ENDPOINT="$(cfg_val endpoint)"; OBJ_PREFIX="$(cfg_val prefix)"; OBJ_CFG_REGION="$(cfg_val region)"
+OBJ_ENDPOINT="${OBJ_ENDPOINT#*://}"; OBJ_ENDPOINT="${OBJ_ENDPOINT%%/*}"          # host[:port]
+OBJ_HOST="$(printf '%s' "${OBJ_ENDPOINT%%:*}" | tr '[:upper:]' '[:lower:]')"
+OBJ_PREFIX="${OBJ_PREFIX#/}"; OBJ_PREFIX="${OBJ_PREFIX%/}"
+_aws_re='(^|\.)amazonaws\.com$'
+_region_re='(^|[.-])([a-z]{2}(-gov)?-[a-z]+-[0-9]+)\.amazonaws\.com$'
+if [[ -z "${OBJ_CFG}" ]]; then
+  OBJ_MODE="minio"
+  warn "cannot read secret ${SECRET}/${KEY}: assuming in-cluster MinIO (bucket/prefix unknown)"
+elif [[ "${OBJ_HOST}" =~ ${_aws_re} ]]; then
+  OBJ_MODE="s3"
+  if [[ "${OBJ_HOST}" =~ ${_region_re} ]]; then OBJ_REGION="${BASH_REMATCH[2]}"; else OBJ_REGION="${OBJ_CFG_REGION:-us-east-1}"; fi
+  echo "== object store: mode=s3 bucket=${OBJ_BUCKET} prefix=${OBJ_PREFIX:-(none)} endpoint=${OBJ_ENDPOINT} region=${OBJ_REGION} =="
+else
+  OBJ_MODE="minio"
+  echo "== object store: mode=minio bucket=${OBJ_BUCKET} prefix=${OBJ_PREFIX:-(none)} endpoint=${OBJ_ENDPOINT} (svc/${OBJ_HOST%%.*}) =="
+fi
 
 # projected upload size (bytes)
 PROJ_BYTES=$(python3 -c "
@@ -191,23 +220,27 @@ if [[ -n "${RET_RC}" ]]; then
 fi
 
 echo "== 3. MinIO free capacity =="
-MINIO_POD="$(oc get pods -n "${NS}" -o name 2>/dev/null | grep -iE 'minio' | grep -viE 'setup|job' | head -1 || true)"
-if [[ -z "${MINIO_POD}" ]]; then
-  warn "no minio pod found; cannot check capacity (verify manually)"
+if [[ "${OBJ_MODE}" == "s3" ]]; then
+  ok "object store is S3 (${OBJ_BUCKET}${OBJ_PREFIX:+/${OBJ_PREFIX}}): no capacity check needed"
 else
-  DF="$(oc exec -n "${NS}" "${MINIO_POD}" -- df -Pk 2>/dev/null || true)"
-  # pick the mount that looks like the data dir; fall back to the largest non-root mount
-  FREEB=$(printf '%s\n' "${DF}" | awk 'NR>1 && $6 !~ /^\/(proc|sys|dev|etc|run|$)/ {print $4*1024" "$6}' | sort -rn | head -1)
-  FREE_BYTES="${FREEB%% *}"; FREE_MNT="${FREEB#* }"
-  if [[ -n "${FREE_BYTES:-}" ]]; then
-    FREE_GB=$(python3 -c "print('%.1f'%(${FREE_BYTES}/1e9))")
-    NEED_BYTES=$(python3 -c "print(int(${HUB_BYTES}*${CAP_MARGIN}))")
-    echo "  free on ${FREE_MNT}: ${FREE_GB} GB; need ~$(python3 -c "print('%.1f'%(${NEED_BYTES}/1e9))") GB (hub footprint x ${CAP_MARGIN})"
-    # compared in python: fails closed on a missing value instead of passing
-    if python3 -c "import sys; sys.exit(0 if ${FREE_BYTES} >= ${NEED_BYTES} else 1)" 2>/dev/null; then ok "enough MinIO capacity"
-    else bad "insufficient MinIO free space: the ${PROJ_GB} GB upload grows to ~${HUB_GB} GB after downsampling"; fi
+  MINIO_POD="$(oc get pods -n "${NS}" -o name 2>/dev/null | grep -iE 'minio' | grep -viE 'setup|job' | head -1 || true)"
+  if [[ -z "${MINIO_POD}" ]]; then
+    warn "no minio pod found; cannot check capacity (verify manually)"
   else
-    warn "could not parse df from minio pod (verify manually)"
+    DF="$(oc exec -n "${NS}" "${MINIO_POD}" -- df -Pk 2>/dev/null || true)"
+    # pick the mount that looks like the data dir; fall back to the largest non-root mount
+    FREEB=$(printf '%s\n' "${DF}" | awk 'NR>1 && $6 !~ /^\/(proc|sys|dev|etc|run|$)/ {print $4*1024" "$6}' | sort -rn | head -1)
+    FREE_BYTES="${FREEB%% *}"; FREE_MNT="${FREEB#* }"
+    if [[ -n "${FREE_BYTES:-}" ]]; then
+      FREE_GB=$(python3 -c "print('%.1f'%(${FREE_BYTES}/1e9))")
+      NEED_BYTES=$(python3 -c "print(int(${HUB_BYTES}*${CAP_MARGIN}))")
+      echo "  free on ${FREE_MNT}: ${FREE_GB} GB; need ~$(python3 -c "print('%.1f'%(${NEED_BYTES}/1e9))") GB (hub footprint x ${CAP_MARGIN})"
+      # compared in python: fails closed on a missing value instead of passing
+      if python3 -c "import sys; sys.exit(0 if ${FREE_BYTES} >= ${NEED_BYTES} else 1)" 2>/dev/null; then ok "enough MinIO capacity"
+      else bad "insufficient MinIO free space: the ${PROJ_GB} GB upload grows to ~${HUB_GB} GB after downsampling"; fi
+    else
+      warn "could not parse df from minio pod (verify manually)"
+    fi
   fi
 fi
 

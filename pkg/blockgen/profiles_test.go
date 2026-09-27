@@ -120,6 +120,49 @@ func countByName(b BlockSpec) map[string]int {
 	return counts
 }
 
+// TestGetEnvDuration mirrors TestGetEnvInt for the duration knob backing
+// RS_SCRAPE_INTERVAL: unset uses the default, Go duration strings parse, and
+// anything else (no unit, "1d", zero or negative) is an error.
+func TestGetEnvDuration(t *testing.T) {
+	const key = "THANOSBENCH_TEST_DURATION"
+	for _, tc := range []struct {
+		val     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"", 15 * time.Minute, false},
+		{"15m", 15 * time.Minute, false},
+		{"24h", 24 * time.Hour, false},
+		{"1h30m", 90 * time.Minute, false},
+		{"0", 0, true},
+		{"0s", 0, true},
+		{"-5m", 0, true},
+		{"15", 0, true},
+		{"1d", 0, true},
+		{"soon", 0, true},
+	} {
+		t.Run(fmt.Sprintf("%q", tc.val), func(t *testing.T) {
+			t.Setenv(key, tc.val)
+			got, err := getEnvDuration(key, 15*time.Minute)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("getEnvDuration(%q) = %v, want error", tc.val, got)
+				}
+				if !strings.Contains(err.Error(), key) {
+					t.Errorf("error %q does not name the variable", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("getEnvDuration(%q): unexpected error %v", tc.val, err)
+			}
+			if got != tc.want {
+				t.Errorf("getEnvDuration(%q) = %v, want %v", tc.val, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestWorkloadPodProfilePreserved(t *testing.T) {
 	if _, ok := Profiles["custom-continous-1-week-workload-pod"]; !ok {
 		t.Fatal("upstream workload/pod profile was removed")
@@ -436,6 +479,116 @@ func TestRightSizingLeveledPodFiller(t *testing.T) {
 		if s.Characteristics.ScrapeInterval != 5*time.Minute {
 			t.Errorf("%s: scrape interval %v, want 5m", name, s.Characteristics.ScrapeInterval)
 		}
+	}
+}
+
+// TestRightSizingLeveledScrapeIntervalGuardUnsortedRanges checks the guard looks
+// at every block length, not only the first one in the range list.
+func TestRightSizingLeveledScrapeIntervalGuardUnsortedRanges(t *testing.T) {
+	t.Setenv("NUM_NAMESPACES", "1")
+	t.Setenv("NUM_WORKLOADS", "1")
+	t.Setenv("NUM_PODS", "1")
+	t.Setenv("NUM_EXTRA_METRICS", "0")
+	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
+	t.Setenv("RS_SCRAPE_INTERVAL", "3h")
+	err := rightSizingLeveled([]time.Duration{8 * time.Hour, 2 * time.Hour})(
+		context.Background(), fixedMaxTime(t), labels.Labels{}, func(BlockSpec) error {
+			t.Fatal("blockEncoder must not be called when the interval exceeds the shortest block")
+			return nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "RS_SCRAPE_INTERVAL") {
+		t.Fatalf("want RS_SCRAPE_INTERVAL guard error, got %v", err)
+	}
+}
+
+// TestRightSizingLeveledScrapeInterval checks RS_SCRAPE_INTERVAL: unset keeps
+// the 15m default, a custom value applies to every acm_rs series and only to
+// them (the extra_* filler stays at 5m), and an invalid or non-positive value
+// fails fast before any block is planned.
+func TestRightSizingLeveledScrapeInterval(t *testing.T) {
+	t.Setenv("NUM_NAMESPACES", "2")
+	t.Setenv("NUM_WORKLOADS", "1")
+	t.Setenv("NUM_PODS", "2")
+	t.Setenv("NUM_EXTRA_METRICS", "1")
+	t.Setenv("NUM_POD_METRICS", "1")
+	t.Setenv("NUM_CLUSTER_METRICS", "1")
+
+	// intervals returns, for the first block of a plan, how many acm_rs series
+	// and how many extra_* filler series use each scrape interval.
+	intervals := func(t *testing.T) (rs, filler map[time.Duration]int) {
+		t.Helper()
+		rs, filler = map[time.Duration]int{}, map[time.Duration]int{}
+		blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
+		for _, s := range blocks[0].Series {
+			name := s.Labels.Get("__name__")
+			switch {
+			case strings.HasPrefix(name, "acm_rs:"):
+				rs[s.Characteristics.ScrapeInterval]++
+			case strings.HasPrefix(name, "extra_"):
+				filler[s.Characteristics.ScrapeInterval]++
+			default:
+				t.Errorf("unexpected series %s", name)
+			}
+		}
+		if len(rs) == 0 || len(filler) == 0 {
+			t.Fatalf("plan emitted %d acm_rs and %d filler intervals, want both non-empty", len(rs), len(filler))
+		}
+		return rs, filler
+	}
+	// only reports whether every series of a kind uses exactly want.
+	only := func(m map[time.Duration]int, want time.Duration) bool {
+		return len(m) == 1 && m[want] > 0
+	}
+
+	t.Run("default", func(t *testing.T) {
+		t.Setenv("RS_SCRAPE_INTERVAL", "")
+		rs, filler := intervals(t)
+		if !only(rs, 15*time.Minute) {
+			t.Errorf("acm_rs intervals = %v, want only 15m", rs)
+		}
+		if !only(filler, 5*time.Minute) {
+			t.Errorf("filler intervals = %v, want only 5m", filler)
+		}
+	})
+
+	for _, tc := range []struct {
+		val  string
+		want time.Duration
+	}{
+		{"90s", 90 * time.Second},
+		{"1h", time.Hour},
+		{"2h", 2 * time.Hour}, // the shortest block: the largest interval allowed
+	} {
+		t.Run(tc.val, func(t *testing.T) {
+			t.Setenv("RS_SCRAPE_INTERVAL", tc.val)
+			rs, filler := intervals(t)
+			if !only(rs, tc.want) {
+				t.Errorf("acm_rs intervals = %v, want only %v", rs, tc.want)
+			}
+			if !only(filler, 5*time.Minute) {
+				t.Errorf("filler intervals = %v, want only 5m (filler must not follow RS_SCRAPE_INTERVAL)", filler)
+			}
+		})
+	}
+
+	// 45m and 1h30m are shorter than the 2h block but do not divide it: the last
+	// sample of each block would land past its end (observed overlaps).
+	for _, val := range []string{"0", "0s", "-1h", "15", "1d", "fifteen", "3h", "24h", "45m", "1h30m", "7m"} {
+		t.Run("invalid "+val, func(t *testing.T) {
+			t.Setenv("RS_SCRAPE_INTERVAL", val)
+			err := rightSizingLeveled([]time.Duration{2 * time.Hour})(
+				context.Background(), fixedMaxTime(t), labels.Labels{}, func(BlockSpec) error {
+					t.Fatal("blockEncoder must not be called on invalid RS_SCRAPE_INTERVAL")
+					return nil
+				})
+			if err == nil {
+				t.Fatalf("RS_SCRAPE_INTERVAL=%q: expected error, got nil", val)
+			}
+			if !strings.Contains(err.Error(), "RS_SCRAPE_INTERVAL") {
+				t.Errorf("error %q does not name RS_SCRAPE_INTERVAL", err)
+			}
+		})
 	}
 }
 

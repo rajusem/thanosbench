@@ -4,7 +4,12 @@
 #   ! REQUIRE_SETTLED=1 bash validate_compaction_180day.sh  # also require compaction/5m/1h done
 #
 # Read-only. Proves the Thanos compactor's work by inspecting every block's
-# meta.json in MinIO (object store = ground truth). Certification-grade:
+# meta.json in the hub's object store (ground truth). The store is whatever the
+# thanos-object-storage Secret (thanos.yaml) points at: bucket, optional prefix,
+# endpoint and creds are all read from it. An AWS S3 endpoint (*.amazonaws.com) is
+# reached directly over https with the region taken from the endpoint (no
+# port-forward); anything else is treated as in-cluster MinIO behind a port-forward
+# to the endpoint's service. Certification-grade:
 #   * RECONCILES listed-vs-fetched metas; refuses to draw conclusions if incomplete
 #   * excludes deletion-marked blocks (they linger ~48h and would skew counts/overlaps)
 #   * overlap check is per (cluster,resolution,LEVEL) with a running-max sweep
@@ -13,11 +18,11 @@
 #   * GAP detection over each tier's union (a missing week won't hide behind "182d")
 #   * PER-CLUSTER verdict, AND-reduced; real pass/fail EXIT CODE
 # Exit: 0 = healthy; 1 = problem (overlaps / gaps / incomplete / --settled shortfall);
-#       2 = environment error (wrong cluster / port-forward / creds).
+#       2 = environment error (wrong cluster / port-forward / endpoint / creds).
 set -uo pipefail
 
 NS="open-cluster-management-observability"
-SECRET="thanos-object-storage"; KEY="thanos.yaml"; MINIO_BUCKET="thanos"; SVC="minio"
+SECRET="thanos-object-storage"; KEY="thanos.yaml"   # bucket/prefix/endpoint/creds all come from here
 MANIFEST="${MANIFEST:-./gen-180day.manifest.json}"
 DEMO_CLUSTERS="${DEMO_CLUSTERS:-ac-test-man-1 ac-test-man-2 ac-test-man-3}"
 EXPECTED_SERVER_SUBSTR="${EXPECTED_SERVER_SUBSTR:-}"
@@ -48,36 +53,76 @@ SERVER="$(oc whoami --show-server)"
 [[ "${SERVER}" == *"${EXPECTED_SERVER_SUBSTR}"* ]] || { echo "ABORT: wrong cluster." >&2; exit 2; }
 
 TMPD="$(mktemp -d)"
+PF_PID=""   # set only in minio mode (port-forward); the trap runs at exit, so it sees the final value
+trap 'if [[ -n "${PF_PID}" ]]; then kill "${PF_PID}" >/dev/null 2>&1; fi; rm -rf "${TMPD}"' EXIT
+# throwaway AWS config: nothing from ~/.aws or the shell's own AWS session may leak in
 export AWS_CONFIG_FILE="${TMPD}/awsconfig" AWS_SHARED_CREDENTIALS_FILE="${TMPD}/awscreds"
+unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN
+
+# --- object store: parse the Thanos objstore config (thanos.yaml) from the MCO secret.
+# Creds go into env only and are never printed.
 CFG="$(oc get secret "${SECRET}" -n "${NS}" -o jsonpath="{.data.${KEY//./\\.}}" | base64 -d)"
-export AWS_ACCESS_KEY_ID="$(printf '%s\n' "${CFG}" | grep -E '^[[:space:]]*access_key:' | head -1 | sed -E 's/.*access_key:[[:space:]]*//' | trim)"
-export AWS_SECRET_ACCESS_KEY="$(printf '%s\n' "${CFG}" | grep -E '^[[:space:]]*secret_key:' | head -1 | sed -E 's/.*secret_key:[[:space:]]*//' | trim)"
-export AWS_REGION="us-east-1" AWS_EC2_METADATA_DISABLED="true"
+cfg_val() { printf '%s\n' "${CFG}" | grep -E "^[[:space:]]*$1:" | head -1 | sed -E "s/^[[:space:]]*$1:[[:space:]]*//" | trim; }
+AWS_ACCESS_KEY_ID="$(cfg_val access_key)"; AWS_SECRET_ACCESS_KEY="$(cfg_val secret_key)"
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_EC2_METADATA_DISABLED="true"
 [[ -n "${AWS_ACCESS_KEY_ID}" && -n "${AWS_SECRET_ACCESS_KEY}" ]] || { echo "ABORT: no creds." >&2; exit 2; }
+BUCKET="$(cfg_val bucket)"; ENDPOINT="$(cfg_val endpoint)"; PREFIX="$(cfg_val prefix)"; CFG_REGION="$(cfg_val region)"
+[[ -n "${BUCKET}" && -n "${ENDPOINT}" ]] || { echo "ABORT: no bucket/endpoint in secret ${SECRET}." >&2; exit 2; }
+ENDPOINT="${ENDPOINT#*://}"; ENDPOINT="${ENDPOINT%%/*}"                # host[:port]
+HOST="$(printf '%s' "${ENDPOINT%%:*}" | tr '[:upper:]' '[:lower:]')"
+PORT="${ENDPOINT##*:}"; [[ "${PORT}" == "${ENDPOINT}" ]] && PORT=""
+PREFIX="${PREFIX#/}"; PREFIX="${PREFIX%/}"
+OBJ_BASE="s3://${BUCKET}${PREFIX:+/${PREFIX}}"                      # blocks live at ${OBJ_BASE}/<ULID>/
 
-oc port-forward "svc/${SVC}" "${LOCAL_PORT}:9000" -n "${NS}" >"${TMPD}/pf.log" 2>&1 &
-PF_PID=$!; trap 'kill "${PF_PID}" >/dev/null 2>&1 || true; rm -rf "${TMPD}"' EXIT
-export AWS_ENDPOINT_URL="http://localhost:${LOCAL_PORT}"
-READY=0; for i in $(seq 1 30); do curl -s -o /dev/null "http://localhost:${LOCAL_PORT}/minio/health/live" && { READY=1; break; }; sleep 1; done
-[[ "${READY}" == "1" ]] || { echo "ABORT: MinIO port-forward not ready (env error, NOT a data verdict)." >&2; exit 2; }
+# mode: an AWS S3 endpoint is reached directly (https, region from the endpoint, no
+# port-forward); anything else is the in-cluster MinIO behind a port-forward to the
+# service named by the endpoint's first DNS label. The endpoint is passed explicitly
+# to every aws call (--endpoint-url) so no AWS_ENDPOINT_URL from the shell can interfere.
+_aws_re='(^|\.)amazonaws\.com$'
+_region_re='(^|[.-])([a-z]{2}(-gov)?-[a-z]+-[0-9]+)\.amazonaws\.com$'   # s3.<region>. / s3-<region>. / s3.dualstack.<region>.
+if [[ "${HOST}" =~ ${_aws_re} ]]; then
+  MODE="s3"
+  if [[ "${HOST}" =~ ${_region_re} ]]; then REGION="${BASH_REMATCH[2]}"; else REGION="${CFG_REGION:-us-east-1}"; fi
+  ENDPOINT_URL="https://${ENDPOINT}"
+  echo "== object store: mode=s3 ${OBJ_BASE} endpoint=${ENDPOINT} region=${REGION} (no port-forward) =="
+else
+  MODE="minio"; SVC="${HOST%%.*}"; SVC="${SVC:-minio}"; REGION="${CFG_REGION:-us-east-1}"
+  ENDPOINT_URL="http://localhost:${LOCAL_PORT}"
+  echo "== object store: mode=minio ${OBJ_BASE} endpoint=${ENDPOINT} (port-forward svc/${SVC} ${LOCAL_PORT}:${PORT:-9000}) =="
+  oc port-forward "svc/${SVC}" "${LOCAL_PORT}:${PORT:-9000}" -n "${NS}" >"${TMPD}/pf.log" 2>&1 &
+  PF_PID=$!
+  READY=0; for i in $(seq 1 30); do curl -s -o /dev/null "http://localhost:${LOCAL_PORT}/minio/health/live" && { READY=1; break; }; sleep 1; done
+  [[ "${READY}" == "1" ]] || { echo "ABORT: MinIO port-forward not ready (env error, NOT a data verdict)." >&2; exit 2; }
+fi
+export AWS_REGION="${REGION}" AWS_DEFAULT_REGION="${REGION}"
 
-echo "== listing blocks =="
-aws s3 ls "s3://${MINIO_BUCKET}/" | awk '/PRE /{print $2}' | sed 's#/$##' > "${TMPD}/all.txt" || true
+echo "== listing blocks under ${OBJ_BASE}/ =="
+# top-level "directories" under the prefix; keep only ULID-shaped names (the compactor
+# also writes debug/metas/, and a shared S3 prefix may hold other objects)
+aws s3 ls "${OBJ_BASE}/" --endpoint-url "${ENDPOINT_URL}" | awk '/PRE /{print $2}' | sed 's#/$##' \
+  | grep -E '^[0-9A-HJKMNP-TV-Z]{26}$' > "${TMPD}/all.txt" || true
 LISTED="$(grep -c . "${TMPD}/all.txt" || true)"
 echo "  top-level blocks: ${LISTED}"
-[[ "${LISTED}" -gt 0 ]] || { echo "ABORT: no blocks listed (port-forward/bucket issue, not a data verdict)." >&2; exit 2; }
+[[ "${LISTED}" -gt 0 ]] || { echo "ABORT: no blocks listed under ${OBJ_BASE}/ (${MODE}: endpoint/bucket/creds issue, not a data verdict)." >&2; exit 2; }
 
-# deletion marks (one recursive listing) so we can exclude soft-deleted blocks
-aws s3 ls "s3://${MINIO_BUCKET}/" --recursive 2>/dev/null | awk '/deletion-mark\.json$/{print $4}' | cut -d/ -f1 | sort -u > "${TMPD}/deleted.txt" || true
+# deletion marks (one recursive listing) so we can exclude soft-deleted blocks; keys come
+# back as <prefix>/<ULID>/deletion-mark.json, so strip the prefix before taking the ULID
+aws s3 ls "${OBJ_BASE}/" --recursive --endpoint-url "${ENDPOINT_URL}" 2>/dev/null \
+  | awk -v pfx="${PREFIX:+${PREFIX}/}" '/deletion-mark\.json$/{k=$4; if (pfx!="" && index(k,pfx)==1) k=substr(k,length(pfx)+1); split(k,a,"/"); print a[1]}' \
+  | sort -u > "${TMPD}/deleted.txt" || true
 echo "  deletion-marked blocks: $(grep -c . "${TMPD}/deleted.txt" || true)"
 
 METAD="${TMPD}/meta"; mkdir -p "${METAD}"
 echo "== fetching meta.json (parallel x${PARALLEL}, reconciled) =="
 FETCHED=0
 for attempt in 1 2 3; do
+  # base/dir/endpoint go in as positional args ($1/$2/$4) of the child shell, only the ULID is
+  # {}-substituted: BSD xargs caps a substituted argument at 255 bytes
+  # shellcheck disable=SC2016
   while IFS= read -r u; do [[ -n "$u" && ! -f "${METAD}/${u}.json" ]] && echo "$u"; done < "${TMPD}/all.txt" \
     | xargs -P "${PARALLEL}" -I{} bash -c \
-      'aws s3 cp "s3://'"${MINIO_BUCKET}"'/{}/meta.json" "'"${METAD}"'/{}.json" --only-show-errors 2>/dev/null || true'
+      'aws s3 cp "$1/$3/meta.json" "$2/$3.json" --only-show-errors --endpoint-url "$4" 2>/dev/null || true' \
+      _ "${OBJ_BASE}" "${METAD}" {} "${ENDPOINT_URL}"
   FETCHED="$(ls -1 "${METAD}" 2>/dev/null | grep -c '\.json$' || true)"
   echo "  attempt ${attempt}: ${FETCHED}/${LISTED}"
   [[ "${FETCHED}" -ge "${LISTED}" ]] && break

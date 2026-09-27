@@ -5,9 +5,16 @@
 > run time and refuse to run unless `EXPECTED_SERVER_SUBSTR` matches the logged-in hub.
 >
 > **Update 2026-09-25:** the profile now has realistic filler (`NUM_POD_METRICS=20
-> NUM_CLUSTER_METRICS=124` → 134,542 series/block for N=100/W=10/P=3) and unique pod
+> NUM_CLUSTER_METRICS=154` → 134,572 series/block for N=100/W=10/P=3) and unique pod
 > names; preflight/upload size capacity for the downsampled copies too. Numbers in
 > §3/§4 marked "without filler" predate this; see the notes under each section.
+>
+> **Update 2026-09-28:** the hub's object store is S3, not in-cluster MinIO.
+> `generate_and_publish.sh` replaces the generate-everything-then-upload flow (§1, §4,
+> §5): one cluster-week at a time, uploaded while the next generates, ~3 GB of local
+> disk, resumable. `configure_hub_s3.sh` points the hub at its S3 prefix; the
+> validators read the object store from the hub's Secret. The MinIO-only scripts
+> (`upload_180day_batched.sh`, `expand_minio_pvc.sh`) are legacy. See `README.md`.
 >
 > **Scope:** generate synthetic ACM right-sizing data (trial or full 180-day), load
 > it into a shared ACM MultiClusterObservability (MCO) hub's Thanos/MinIO backstore,
@@ -111,7 +118,7 @@ Series/block = `3 profiles × (6 measures × (1 + N + N·W + N·W·P) + 2N)`.
 | **Full** (default driver) | 40 / 10 / 20 | 152,178 | 3 clusters × 234 | ~79 GB |
 
 The table is **without filler**. With the recommended filler (`NUM_POD_METRICS=20
-NUM_CLUSTER_METRICS=124`, N=100/W=10/P=3) a block has 134,542 series and one cluster-week
+NUM_CLUSTER_METRICS=154`, N=100/W=10/P=3) a block has 134,572 series and one cluster-week
 measured ~0.92 GB, so 20 clusters × 26 weeks is ~0.5 TB to upload and ~3 TB on the hub
 after downsampling.
 

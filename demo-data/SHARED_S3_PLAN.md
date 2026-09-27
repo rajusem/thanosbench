@@ -3,9 +3,11 @@
 > Revised after 3-lens review (Architecture / PE / QE). All BLOCKER and MAJOR
 > findings addressed. See "Review findings" section at the bottom for traceability.
 >
-> **Status:** design only. `upload_to_s3.sh`, `load_from_s3.sh` and
-> `validate_s3_source.sh` are not built yet; the scripts that exist today are in
-> `demo-data/README.md`.
+> **Status:** partly implemented. `generate_and_publish.sh` covers the generator side
+> (per-block upload with `meta.json` last, `manifest.json` written last, optional
+> server-side copy into a hub prefix); `configure_hub_s3.sh` points a hub at its prefix.
+> `load_from_s3.sh` and `validate_s3_source.sh` (checksums, IAM model) are not built
+> yet; today a consumer copies the blocks server-side as described in `README.md`.
 
 ## Goal
 Generate right-sizing demo blocks once locally, store them in a shared AWS S3 bucket,
@@ -69,8 +71,8 @@ validate_s3_source.sh. All fields are required.
   "series_per_block": 74418,          // right-sizing + filler series per block
   "rs_series_per_block": 74418,
   "filler_series_per_block": 0,       // NUM_EXTRA_METRICS x N + NUM_POD_METRICS x N x W x P + NUM_CLUSTER_METRICS
-  "num_extra_metrics": 0,             // recommended filler: 0 / 20 / 124 ->
-  "num_pod_metrics": 0,               //   60,124 filler, 134,542 series/block
+  "num_extra_metrics": 0,             // recommended filler: 0 / 20 / 154 ->
+  "num_pod_metrics": 0,               //   60,154 filler, 134,572 series/block
   "num_cluster_metrics": 0,
   "blocks_per_cluster": 234,
   "expected_blocks": 4680,
@@ -345,7 +347,7 @@ CONSUMER (per team):
 | MinIO PVC on consumer cluster | already provisioned |
 
 These figures are for data without filler. With the recommended filler
-(`NUM_POD_METRICS=20 NUM_CLUSTER_METRICS=124`) the dataset is ~0.5 TB, and each consumer
+(`NUM_POD_METRICS=20 NUM_CLUSTER_METRICS=154`) the dataset is ~0.5 TB, and each consumer
 hub holds ~5–6× that after its compactor downsamples it.
 
 ---
