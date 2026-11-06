@@ -1,0 +1,5 @@
+backups/
+work/
+*.secret.yaml
+*.credentials
+__pycache__/

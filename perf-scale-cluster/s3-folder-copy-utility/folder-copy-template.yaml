@@ -1,0 +1,215 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: ceph-folder-copy
+  annotations:
+    description: Copy one AWS S3 folder to a separate Ceph RGW prefix using existing cluster Secrets.
+parameters:
+  - name: JOB_NAME
+    required: true
+  - name: MODE
+    required: true
+    description: One of inventory, dry-run, copy, or check.
+  - name: SOURCE_BUCKET
+    required: true
+  - name: SOURCE_PREFIX
+    required: true
+    description: Folder path within SOURCE_BUCKET, ending in /.
+  - name: DEST_PREFIX
+    required: true
+    description: Separate folder path within CEPH_BUCKET, ending in /.
+  - name: CEPH_BUCKET
+    value: thanos-ceph-97e777ff-c845-4595-9eea-71fc4f10ad62
+  - name: SOURCE_REGION
+    value: us-west-2
+  - name: AWS_SECRET_NAME
+    value: thanos-object-storage
+objects:
+  - apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: ${JOB_NAME}
+      labels:
+        app: ceph-folder-copy
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: ceph-folder-copy
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: rclone
+              image: rclone/rclone:1.75.2
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  umask 077
+                  mkdir -p /work/cache /work/tmp
+
+                  case "$MODE" in
+                    inventory|dry-run|copy|check) ;;
+                    *) echo 'MODE must be inventory, dry-run, copy, or check' >&2; exit 1 ;;
+                  esac
+                  case "$SOURCE_BUCKET" in
+                    ''|*/*) echo 'SOURCE_BUCKET must be a bucket name' >&2; exit 1 ;;
+                  esac
+                  case "$CEPH_BUCKET" in
+                    ''|*/*) echo 'CEPH_BUCKET must be a bucket name' >&2; exit 1 ;;
+                  esac
+                  case "$SOURCE_PREFIX" in
+                    ''|/*) echo 'SOURCE_PREFIX must be a nonempty relative folder' >&2; exit 1 ;;
+                    */) ;;
+                    *) echo 'SOURCE_PREFIX must end in /' >&2; exit 1 ;;
+                  esac
+                  case "$DEST_PREFIX" in
+                    ''|/*) echo 'DEST_PREFIX must be a nonempty relative folder' >&2; exit 1 ;;
+                    */) ;;
+                    *) echo 'DEST_PREFIX must end in /' >&2; exit 1 ;;
+                  esac
+
+                  aws_access_key="$(sed -n 's/^[[:space:]]*access_key:[[:space:]]*//p' /secrets/aws/thanos.yaml | head -n 1)"
+                  aws_secret_key="$(sed -n 's/^[[:space:]]*secret_key:[[:space:]]*//p' /secrets/aws/thanos.yaml | head -n 1)"
+                  ceph_access_key="$(cat /secrets/ceph/AWS_ACCESS_KEY_ID)"
+                  ceph_secret_key="$(cat /secrets/ceph/AWS_SECRET_ACCESS_KEY)"
+                  [ -n "$aws_access_key" ] && [ -n "$aws_secret_key" ] && [ -n "$ceph_access_key" ] && [ -n "$ceph_secret_key" ] || {
+                    echo 'Missing S3 credentials in mounted Secrets' >&2
+                    exit 1
+                  }
+
+                  cat > /work/rclone.conf <<EOF
+                  [aws-source]
+                  type = s3
+                  provider = AWS
+                  env_auth = false
+                  access_key_id = $aws_access_key
+                  secret_access_key = $aws_secret_key
+                  region = $SOURCE_REGION
+
+                  [ceph-dest]
+                  type = s3
+                  provider = Ceph
+                  env_auth = false
+                  access_key_id = $ceph_access_key
+                  secret_access_key = $ceph_secret_key
+                  endpoint = https://rook-ceph-rgw-ocs-storagecluster-cephobjectstore.openshift-storage.svc:443
+                  force_path_style = true
+                  EOF
+                  unset aws_access_key aws_secret_key ceph_access_key ceph_secret_key
+
+                  source="aws-source:$SOURCE_BUCKET/$SOURCE_PREFIX"
+                  dest="ceph-dest:$CEPH_BUCKET/$DEST_PREFIX"
+                  start_epoch="$(date +%s)"
+                  echo "mode=$MODE source=s3://$SOURCE_BUCKET/$SOURCE_PREFIX destination=ceph://$CEPH_BUCKET/$DEST_PREFIX"
+                  case "$MODE" in
+                    inventory)
+                      echo 'source_inventory:'
+                      rclone --config /work/rclone.conf \
+                        --ca-cert /etc/ssl/certs/ca-certificates.crt \
+                        --ca-cert /secrets/service-ca/service-ca.crt \
+                        size "$source" --json
+                      echo 'destination_inventory:'
+                      rclone --config /work/rclone.conf \
+                        --ca-cert /etc/ssl/certs/ca-certificates.crt \
+                        --ca-cert /secrets/service-ca/service-ca.crt \
+                        size "$dest" --json
+                      ;;
+                    dry-run|copy)
+                      if [ "$MODE" = dry-run ]; then set -- --dry-run; else set --; fi
+                      rclone --config /work/rclone.conf \
+                        --ca-cert /etc/ssl/certs/ca-certificates.crt \
+                        --ca-cert /secrets/service-ca/service-ca.crt \
+                        copy "$source" "$dest" "$@" \
+                        --size-only --immutable \
+                        --transfers 4 --checkers 8 \
+                        --stats 1m --stats-one-line --stats-log-level NOTICE \
+                        --log-level INFO
+                      ;;
+                    check)
+                      rclone --config /work/rclone.conf \
+                        --ca-cert /etc/ssl/certs/ca-certificates.crt \
+                        --ca-cert /secrets/service-ca/service-ca.crt \
+                        check "$source" "$dest" --size-only \
+                        --checkers 8 --stats 1m --stats-one-line \
+                        --stats-log-level NOTICE --log-level INFO
+                      ;;
+                  esac
+                  end_epoch="$(date +%s)"
+                  echo "elapsed_seconds=$((end_epoch - start_epoch))"
+              env:
+                - name: MODE
+                  value: ${MODE}
+                - name: SOURCE_BUCKET
+                  value: ${SOURCE_BUCKET}
+                - name: SOURCE_PREFIX
+                  value: ${SOURCE_PREFIX}
+                - name: DEST_PREFIX
+                  value: ${DEST_PREFIX}
+                - name: CEPH_BUCKET
+                  value: ${CEPH_BUCKET}
+                - name: SOURCE_REGION
+                  value: ${SOURCE_REGION}
+                - name: HOME
+                  value: /work
+                - name: XDG_CONFIG_HOME
+                  value: /work/config
+                - name: XDG_CACHE_HOME
+                  value: /work/cache
+                - name: TMPDIR
+                  value: /work/tmp
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 512Mi
+                limits:
+                  cpu: "2"
+                  memory: 2Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+                - name: aws-secret
+                  mountPath: /secrets/aws
+                  readOnly: true
+                - name: ceph-secret
+                  mountPath: /secrets/ceph
+                  readOnly: true
+                - name: service-ca
+                  mountPath: /secrets/service-ca
+                  readOnly: true
+          volumes:
+            - name: work
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Mi
+            - name: aws-secret
+              secret:
+                secretName: ${AWS_SECRET_NAME}
+                items:
+                  - key: thanos.yaml
+                    path: thanos.yaml
+            - name: ceph-secret
+              secret:
+                secretName: thanos-ceph
+                items:
+                  - key: AWS_ACCESS_KEY_ID
+                    path: AWS_ACCESS_KEY_ID
+                  - key: AWS_SECRET_ACCESS_KEY
+                    path: AWS_SECRET_ACCESS_KEY
+            - name: service-ca
+              configMap:
+                name: openshift-service-ca.crt
+                items:
+                  - key: service-ca.crt
+                    path: service-ca.crt
