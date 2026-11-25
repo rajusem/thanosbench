@@ -36,6 +36,8 @@ NUM_PODS="${NUM_PODS:-3}"
 NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}"
 NUM_POD_METRICS="${NUM_POD_METRICS:-20}"
 NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-154}"
+NUM_NODES="${NUM_NODES:-0}"
+NUM_NODE_METRICS="${NUM_NODE_METRICS:-0}"
 WORKERS="${WORKERS:-8}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"                    # cluster-weeks on local disk at once (~1 GB each)
 UPLOAD_BLOCK_PARALLEL="${UPLOAD_BLOCK_PARALLEL:-3}"  # blocks of one cluster-week uploaded at once; a single
@@ -67,7 +69,7 @@ GEN_SECONDS_PER_CLUSTER_WEEK="${GEN_SECONDS_PER_CLUSTER_WEEK:-90}"   # measured 
 DS_5M_RATIO="${DS_5M_RATIO:-3.8}"; DS_1H_RATIO="${DS_1H_RATIO:-1.1}"
 
 # ---- validation --------------------------------------------------------------
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS NUM_NODES NUM_NODE_METRICS MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 1; }
 done
 [[ "$WEEKS" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
@@ -96,8 +98,8 @@ log() { echo "$(date -u +%H:%M:%S) $*"; }
 # ---- plan --------------------------------------------------------------------
 # shellcheck disable=SC2086  # split the space-separated cluster list on purpose
 NCL=$(printf '%s\n' $CLUSTERS | grep -c .)
-RS_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print(3*(6*(1+N+N*W+N*W*P)+2*N))")
-FILLER_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print($NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P+$NUM_CLUSTER_METRICS)")
+RS_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print(3*(8*(1+N+N*W+N*W*P)+2*N+N*W*P))")
+FILLER_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print($NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P+$NUM_NODE_METRICS*$NUM_NODES+$NUM_CLUSTER_METRICS)")
 SPB=$(python3 -c "print($RS_SPB+$FILLER_SPB)")
 TOTAL_CW=$(( NCL * WEEKS ))
 BLOCKS=$(( TOTAL_CW * BLOCKS_PER_WEEK ))
@@ -107,7 +109,11 @@ HUB_GB=$(python3 -c "print('%.1f'%($CW_BYTES*$TOTAL_CW*(1+$DS_5M_RATIO+$DS_1H_RA
 LOCAL_GB=$(python3 -c "print('%.1f'%($CW_BYTES*($MAX_INFLIGHT+1)/1e9))")
 GEN_H=$(python3 -c "print('%.1f'%($TOTAL_CW*$GEN_SECONDS_PER_CLUSTER_WEEK/3600))")
 
-PARAMS="profile=$PROFILE blocks_per_week=$BLOCKS_PER_WEEK clusters=[$CLUSTERS] N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS extra=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS cluster=$NUM_CLUSTER_METRICS rs_interval=${RS_SCRAPE_INTERVAL:-15m} bucket=$BUCKET shared=$SHARED_PREFIX hub=$HUB_PREFIX per_cluster=$PER_CLUSTER_PREFIX"
+NODE_PARAMS=""
+if [[ "$NUM_NODES" != "0" || "$NUM_NODE_METRICS" != "0" ]]; then
+  NODE_PARAMS=" nodes=$NUM_NODES node_metrics=$NUM_NODE_METRICS"
+fi
+PARAMS="profile=$PROFILE blocks_per_week=$BLOCKS_PER_WEEK clusters=[$CLUSTERS] N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS extra=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS cluster=$NUM_CLUSTER_METRICS${NODE_PARAMS} rs_interval=${RS_SCRAPE_INTERVAL:-15m} bucket=$BUCKET shared=$SHARED_PREFIX hub=$HUB_PREFIX per_cluster=$PER_CLUSTER_PREFIX"
 if [[ -f "$WORK/state/params" && "$(cat "$WORK/state/params")" != "$PARAMS" ]]; then
   echo "ABORT: $WORK was started with different parameters:" >&2; echo "  was: $(cat "$WORK/state/params")" >&2; echo "  now: $PARAMS" >&2
   echo "  Only WEEKS may change between runs; use a new WORK dir (and SHARED_PREFIX) for a different dataset." >&2; exit 1
@@ -122,7 +128,7 @@ fi
 echo "== plan =="
 echo "  profile:      $PROFILE ($BLOCKS_PER_WEEK blocks/week)"
 echo "  clusters:     $NCL; weeks: $WEEKS (~$(( WEEKS*7 )) days); cluster-weeks: $TOTAL_CW; blocks: $BLOCKS"
-echo "  cardinality:  N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS -> $RS_SPB right-sizing + $FILLER_SPB filler = $SPB series/block"
+echo "  cardinality:  N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS nodes=$NUM_NODES -> $RS_SPB right-sizing + $FILLER_SPB filler = $SPB series/block"
 echo "  window:       $(iso $(( BASE_EPOCH - WEEKS*7*86400 ))) .. $(iso "$BASE_EPOCH") (pinned)"
 if [[ "$PER_CLUSTER_PREFIX" == "1" ]]; then
   echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/<cluster>/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
@@ -156,7 +162,7 @@ json.dump({
   "base_epoch": $BASE_EPOCH, "weeks": $WEEKS, "blocks_per_week": $BLOCKS_PER_WEEK,
   "clusters": "$CLUSTERS".split(),
   "num_namespaces": $NUM_NAMESPACES, "num_workloads": $NUM_WORKLOADS, "num_pods": $NUM_PODS,
-  "num_extra_metrics": $NUM_EXTRA_METRICS, "num_pod_metrics": $NUM_POD_METRICS, "num_cluster_metrics": $NUM_CLUSTER_METRICS,
+  "num_extra_metrics": $NUM_EXTRA_METRICS, "num_pod_metrics": $NUM_POD_METRICS, "num_node_metrics": $NUM_NODE_METRICS, "num_nodes": $NUM_NODES, "num_cluster_metrics": $NUM_CLUSTER_METRICS,
   "rs_scrape_interval": "${RS_SCRAPE_INTERVAL:-15m}",
   "series_per_block": $SPB, "rs_series_per_block": $RS_SPB, "filler_series_per_block": $FILLER_SPB,
   "blocks_per_cluster": $(( WEEKS * BLOCKS_PER_WEEK )), "expected_blocks": $BLOCKS,
@@ -186,6 +192,7 @@ generate_cw() { # $1=cluster $2=week $3=dir
   rm -rf "$dir"; mkdir -p "$dir"
   ( cd "$dir" && NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
       NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS \
+      NUM_NODES=$NUM_NODES NUM_NODE_METRICS=$NUM_NODE_METRICS \
       MIN_GAUGE="${gauges% *}" MAX_GAUGE="${gauges#* }" \
       "$TB" block plan -p "$PROFILE" --labels "cluster=\"$cluster\"" --labels "aggregation=\"1d\"" --max-time "$maxt" \
       | "$TB" block gen --output.dir "$dir" --workers "$WORKERS" ) > "$WORK/log/$cluster-w$w.gen.log" 2>&1
