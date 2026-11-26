@@ -52,6 +52,10 @@ spec:
           value: ""
         - name: AWS_SHARED_CREDENTIALS_FILE
           value: /credentials/credentials
+        - name: GOMAXPROCS
+          value: "8"
+        - name: GOMEMLIMIT
+          value: 16GiB
         - name: TB
           value: /work/runner/thanosbench
         - name: WORK
@@ -61,9 +65,9 @@ spec:
         resources:
           requests:
             cpu: "8"
-            memory: 4Gi
+            memory: 32Gi
           limits:
-            memory: 12Gi
+            memory: 64Gi
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

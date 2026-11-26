@@ -15,7 +15,9 @@ for the pilot. Use a session that covers the expected Job runtime.
 From the repository root, build for the worker architecture and create the pilot
 using a fresh S3 prefix and a fresh PVC. The manifest defaults to the RDU2 Ceph
 RBD storage class. Select the appropriate storage class before applying it to
-another cluster.
+another cluster. The Linux build was tested with Go 1.25.1. The Job requests
+eight CPUs and 32 GiB of memory and sets a 16 GiB Go memory target within its
+64 GiB container limit.
 
 ```bash
 NS=thanosbench-pilot
@@ -38,9 +40,10 @@ Once the `stage` init container is running, copy and verify the binary on the
 PVC. The generator starts as soon as the transfer succeeds.
 
 ```bash
-oc -n "$NS" get pods -l job-name=thanosbench-pilot
+oc -n "$NS" wait --for='jsonpath={.status.initContainerStatuses[0].state.running.startedAt}' \
+  --timeout=2m pod -l job-name=thanosbench-pilot
 bash demo-data/openshift/stage.sh "$NS" /tmp/thanosbench-linux-amd64
-oc -n "$NS" logs -f job/thanosbench-pilot -c generate
+oc -n "$NS" logs --pod-running-timeout=2m -f job/thanosbench-pilot -c generate
 ```
 
 The pilot generates 54 blocks for one cluster over six weeks at 160,264 series
