@@ -71,10 +71,13 @@ comparison, use `$TEST_ROOT/full-26w-direct-7way` and a separate `WORK` director
 
 ## Prepared 100-cluster run
 
-`full-1-100.yaml` declares a 50 GiB PVC and a suspended Job for clusters
+`full-1-100.yaml` declares an 80 GiB PVC and a suspended Job for clusters
 `ac-test-man-1` through `ac-test-man-100`. `full-1-100.env` pins the 26-week
-window with `BASE_EPOCH_OVERRIDE=1792800000`, seven direct generators and seven
-upload slots. Blocks use the flat layout for the downstream hub loader.
+window with `BASE_EPOCH_OVERRIDE=1792800000`, 18 direct generators and 18 upload
+slots. The Job requests 72 CPUs and 224 GiB of RAM with a 256 GiB memory limit,
+matching the 18-slot pilot. The PVC has room for the combined generation and
+upload queues and blocks retained for retry. Blocks use the flat layout for the
+downstream hub loader.
 
 Create the `thanosbench-full-1-100-settings` and `thanosbench-full-1-100-runner`
 ConfigMaps from `full-1-100.env` and `generate_and_publish.sh`, respectively.

@@ -7,7 +7,7 @@ spec:
   storageClassName: ocs-storagecluster-ceph-rbd
   resources:
     requests:
-      storage: 50Gi
+      storage: 80Gi
 ---
 apiVersion: batch/v1
 kind: Job
@@ -57,7 +57,7 @@ spec:
           value: /work/data/manifest.final.json
         resources:
           requests:
-            cpu: "56"
+            cpu: "72"
             memory: 224Gi
           limits:
             memory: 256Gi
