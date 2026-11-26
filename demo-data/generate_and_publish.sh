@@ -290,8 +290,14 @@ wait_for_slot() { while [[ "$(inflight)" -ge "$MAX_INFLIGHT" ]]; do sleep 5; don
 # Walk the tree from the top-level shell instead, where $$ is correct, deepest
 # first so each aws is signalled before the shell that is waiting on it.
 kill_descendants() { # $1=pid
-  local child
-  for child in $(pgrep -P "$1" 2>/dev/null); do
+  local child children=""
+  if command -v pgrep >/dev/null; then
+    children="$(pgrep -P "$1" 2>/dev/null || true)"
+  elif [[ -r "/proc/$1/task/$1/children" ]]; then
+    # Minimal Linux containers may lack pgrep. procfs can omit the final newline.
+    IFS= read -r children < "/proc/$1/task/$1/children" || true
+  fi
+  for child in $children; do
     kill_descendants "$child"
     kill -TERM "$child" 2>/dev/null || true
   done
