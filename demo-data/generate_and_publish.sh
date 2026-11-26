@@ -47,6 +47,9 @@ UPLOAD_BLOCK_PARALLEL="${UPLOAD_BLOCK_PARALLEL:-3}"  # blocks of one cluster-wee
                                                      # own concurrency, so throughput comes from more streams
 UPLOAD_RETRY_ROUNDS="${UPLOAD_RETRY_ROUNDS:-3}"      # extra end-of-run attempts for failed cluster-week uploads
 UPLOAD_RETRY_DELAY_SECONDS="${UPLOAD_RETRY_DELAY_SECONDS:-30}" # backoff before retry rounds 2+ (30s, 60s, ...)
+MAX_FAILED_UPLOADS="${MAX_FAILED_UPLOADS:-0}"        # pause generation and retry at this many failed weeks; 0 disables
+AWS_SESSION_EXPIRY_FILE="${AWS_SESSION_EXPIRY_FILE:-}" # optional mounted Unix expiration timestamp
+AWS_MIN_SESSION_SECONDS="${AWS_MIN_SESSION_SECONDS:-0}"
 WORK="${WORK:-./gen-work}"
 TB="${TB:-$(cd "$(dirname "$0")/.." && pwd)/thanosbench}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -71,7 +74,7 @@ GEN_SECONDS_PER_CLUSTER_WEEK="${GEN_SECONDS_PER_CLUSTER_WEEK:-90}"   # measured 
 DS_5M_RATIO="${DS_5M_RATIO:-3.8}"; DS_1H_RATIO="${DS_1H_RATIO:-1.1}"
 
 # ---- validation --------------------------------------------------------------
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS NUM_NODES NUM_NODE_METRICS GEN_PARALLEL MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS NUM_NODES NUM_NODE_METRICS GEN_PARALLEL MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS MAX_FAILED_UPLOADS AWS_MIN_SESSION_SECONDS; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 1; }
 done
 [[ "$WEEKS" -ge 1 && "$GEN_PARALLEL" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS, GEN_PARALLEL and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
@@ -142,18 +145,31 @@ fi
 echo "  projected:    ~$PROJ_GB GB to upload; ~$HUB_GB GB on the hub after downsampling; peak local disk ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
 echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week with $GEN_PARALLEL generator(s); uploads overlap with generation"
 echo "  uploads:      $MAX_INFLIGHT cluster-week(s) in flight x $UPLOAD_BLOCK_PARALLEL parallel block(s) = up to $(( MAX_INFLIGHT * UPLOAD_BLOCK_PARALLEL )) concurrent S3 streams"
-echo "  retries:      $UPLOAD_RETRY_ROUNDS end-of-run upload round(s); retry backoff starts at ${UPLOAD_RETRY_DELAY_SECONDS}s"
+echo "  retries:      $UPLOAD_RETRY_ROUNDS upload retry round(s); retry backoff starts at ${UPLOAD_RETRY_DELAY_SECONDS}s"
+if (( MAX_FAILED_UPLOADS > 0 )); then
+  echo "  pause:        retry before generating more after $MAX_FAILED_UPLOADS failed cluster-week(s)"
+fi
 python3 -c "import sys; sys.exit(0 if $SPB > 5000000 else 1)" && { echo "ABORT: $SPB series/block > maxSeriesPerBlock=5,000,000." >&2; exit 1; }
 [[ "$DRY_RUN" == "1" ]] && { echo "== DRY_RUN: nothing generated or uploaded. =="; exit 0; }
 mkdir -p "$WORK/state" "$WORK/tmp" "$WORK/log"
 
 # ---- S3 access ---------------------------------------------------------------
+if [[ -n "$AWS_SESSION_EXPIRY_FILE" || "$AWS_MIN_SESSION_SECONDS" -gt 0 ]]; then
+  [[ -r "$AWS_SESSION_EXPIRY_FILE" ]] || { echo "ABORT: AWS session expiration file is missing: $AWS_SESSION_EXPIRY_FILE" >&2; exit 1; }
+  expiry="$(cat "$AWS_SESSION_EXPIRY_FILE")"
+  [[ "$expiry" =~ ^[1-9][0-9]{9}$ ]] || { echo "ABORT: AWS session expiration must be a Unix timestamp." >&2; exit 1; }
+  remaining=$(( expiry - $(date +%s) ))
+  (( remaining > 0 && remaining >= AWS_MIN_SESSION_SECONDS )) || {
+    echo "ABORT: AWS session has ${remaining}s left, requires at least ${AWS_MIN_SESSION_SECONDS}s. Refresh the credentials before starting." >&2
+    exit 1
+  }
+  log "AWS session valid until $(iso "$expiry") (${remaining}s remaining)"
+fi
 aws_ sts get-caller-identity >/dev/null || { echo "ABORT: AWS credentials not usable (profile '$AWS_PROFILE_NAME')." >&2; exit 1; }
-aws_ s3api head-bucket --bucket "$BUCKET" >/dev/null || { echo "ABORT: cannot access bucket $BUCKET." >&2; exit 1; }
-if [[ ! -f "$WORK/state/base_epoch" ]]; then
+first_key="$(aws_ s3api list-objects-v2 --bucket "$BUCKET" --prefix "$SHARED_PREFIX/" --no-paginate --max-keys 1 --query 'Contents[0].Key' --output text)" \
+  || { echo "ABORT: cannot list s3://$BUCKET/$SHARED_PREFIX/ (permissions?)." >&2; exit 1; }
+if [[ ! -f "$WORK/state/base_epoch" || ( ! -f "$WORK/state/params" && ! -f "$WORK/manifest.json" ) ]]; then
   # a fresh run must not land on top of an existing dataset
-  first_key="$(aws_ s3api list-objects-v2 --bucket "$BUCKET" --prefix "$SHARED_PREFIX/" --max-keys 1 --query 'Contents[0].Key' --output text)" \
-    || { echo "ABORT: cannot list s3://$BUCKET/$SHARED_PREFIX/ (permissions?)." >&2; exit 1; }
   [[ "$first_key" == "None" ]] || { echo "ABORT: s3://$BUCKET/$SHARED_PREFIX/ is not empty ($first_key) and $WORK has no state for it. Use a new SHARED_PREFIX or the WORK dir of the run that created it." >&2; exit 1; }
   echo "$BASE_EPOCH" > "$WORK/state/base_epoch"
   echo "$PARAMS" > "$WORK/state/params"
@@ -277,7 +293,7 @@ publish_cw() { # $1=cluster $2=week $3=dir $4=attempt label; runs in the backgro
   local upload_log="$WORK/log/$1-w$2.upload.log" attempt="${4:-initial}"
   if { echo "== $attempt upload attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ) =="; publish_body "$1" "$2" "$3"; } >> "$upload_log" 2>&1; then :; else
     touch "$WORK/state/$1.w$2.failed"; echo "FAILED (see $upload_log)" >> "$upload_log"
-    log "upload of $1 week $2 FAILED ($(tail -1 "$upload_log" | cut -c1-120)); the run continues and will retry at the end" >&2
+    log "upload of $1 week $2 FAILED ($(tail -1 "$upload_log" | cut -c1-120)); saved for retry" >&2
   fi
 }
 
@@ -306,7 +322,7 @@ generate_and_queue() { # $1=ordinal $2=cluster $3=week
 
 parallel_generate_and_publish() {
   local cluster w task ordinal=0 total=0 next=0 ready_head=0 ready_end=0
-  local generating=0 uploading=0 failed=0
+  local generating=0 uploading=0 failed=0 failed_uploads=0 paused=0
   local clusters=() weeks=() ordinals=() ready=() generation_pid=() upload_pid=()
   for cluster in $CLUSTERS; do
     for (( w = 0; w < WEEKS; w++ )); do
@@ -317,12 +333,21 @@ parallel_generate_and_publish() {
     done
   done
 
+  if (( MAX_FAILED_UPLOADS > 0 )); then
+    failed_uploads=$(count_state failed)
+    if (( failed_uploads >= MAX_FAILED_UPLOADS )); then return 2; fi
+  fi
+
   # Reap Bash child jobs without wait -n (unavailable on macOS Bash 3.2).
   # Limit generated-but-unpublished data as well as the two worker pools.
-  while (( (next < total && !failed) || generating || uploading || ready_head < ready_end )); do
+  while (( (next < total && !failed && !paused) || generating || uploading || ready_head < ready_end )); do
     for task in "${!upload_pid[@]}"; do
       kill -0 "${upload_pid[task]}" 2>/dev/null && continue
       wait "${upload_pid[task]}" || failed=1
+      if (( MAX_FAILED_UPLOADS > 0 )) && [[ -f "$WORK/state/${clusters[task]}.w${weeks[task]}.failed" ]]; then
+        failed_uploads=$((failed_uploads+1))
+        if (( failed_uploads >= MAX_FAILED_UPLOADS )); then paused=1; fi
+      fi
       unset 'upload_pid[task]'
       uploading=$((uploading-1))
     done
@@ -343,7 +368,7 @@ parallel_generate_and_publish() {
       upload_pid[task]=$!
       ready_head=$((ready_head+1)); uploading=$((uploading+1))
     done
-    while (( !failed && next < total && generating < GEN_PARALLEL &&
+    while (( !failed && !paused && next < total && generating < GEN_PARALLEL &&
              generating + uploading + ready_end - ready_head < GEN_PARALLEL + MAX_INFLIGHT )); do
       generate_and_queue "${ordinals[next]}" "${clusters[next]}" "${weeks[next]}" &
       generation_pid[next]=$!
@@ -355,6 +380,7 @@ parallel_generate_and_publish() {
     echo "== worker failed; re-run the same command to resume ==" >&2
     return 1
   fi
+  if (( paused )); then return 2; fi
 }
 
 # bash 3.2 has no BASHPID, so a background subshell cannot name itself to
@@ -491,11 +517,27 @@ generate_serially() {
 
 # ---- main loop ---------------------------------------------------------------
 START=$(date +%s)
-if (( GEN_PARALLEL == 1 )); then
+if (( GEN_PARALLEL == 1 && MAX_FAILED_UPLOADS == 0 )); then
   generate_serially
 else
   wait  # finish the bounded resume uploads before opening the parallel queues
-  parallel_generate_and_publish
+  while :; do
+    rc=0
+    parallel_generate_and_publish || rc=$?
+    case "$rc" in
+      0) break ;;
+      2)
+        log "pausing generation to retry $(count_state failed) failed cluster-week uploads"
+        retry_failed_uploads
+        if [[ "$(count_state failed)" -gt 0 ]]; then
+          echo "== upload retries exhausted; checkpoint retained. Fix S3 access and resume the same run. ==" >&2
+          exit 1
+        fi
+        log "upload backlog cleared; resuming generation"
+        ;;
+      *) exit "$rc" ;;
+    esac
+  done
 fi
 wait
 retry_failed_uploads

@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: thanosbench-full-1-100-work
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ocs-storagecluster-ceph-rbd
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: thanosbench-full-1-100
+spec:
+  suspend: true
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/hostname: d28-h05-000-r750
+        node-role.kubernetes.io/worker: ""
+      containers:
+      - name: generate
+        image: public.ecr.aws/aws-cli/aws-cli:2.38.1
+        command: [/bin/bash, -ec]
+        args:
+        - |
+          export CLUSTERS="$(printf 'ac-test-man-%s ' {1..100})"
+          exec /bin/bash /runner/generate_and_publish.sh
+        envFrom:
+        - configMapRef:
+            name: thanosbench-full-1-100-settings
+        env:
+        - name: HOME
+          value: /tmp
+        - name: AWS_PAGER
+          value: ""
+        - name: AWS_SHARED_CREDENTIALS_FILE
+          value: /credentials/credentials
+        - name: AWS_SESSION_EXPIRY_FILE
+          value: /credentials/expires_at
+        - name: GOMAXPROCS
+          value: "8"
+        - name: GOMEMLIMIT
+          value: 16GiB
+        - name: TB
+          value: /work/runner/thanosbench
+        - name: WORK
+          value: /work/data
+        - name: MANIFEST
+          value: /work/data/manifest.final.json
+        resources:
+          requests:
+            cpu: "56"
+            memory: 224Gi
+          limits:
+            memory: 256Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: runner
+          mountPath: /runner
+          readOnly: true
+        - name: aws
+          mountPath: /credentials
+          readOnly: true
+      volumes:
+      - name: work
+        persistentVolumeClaim:
+          claimName: thanosbench-full-1-100-work
+      - name: runner
+        configMap:
+          name: thanosbench-full-1-100-runner
+      - name: aws
+        secret:
+          secretName: thanosbench-full-1-100-aws

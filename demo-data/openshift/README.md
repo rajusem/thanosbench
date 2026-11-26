@@ -69,6 +69,28 @@ Set `GEN_DIRECT=1` to generate from the same profile in one process. This
 requires a binary built with `block gen --profile` support. For a benchmark
 comparison, use `$TEST_ROOT/full-26w-direct-7way` and a separate `WORK` directory.
 
+## Prepared 100-cluster run
+
+`full-1-100.yaml` declares a 50 GiB PVC and a suspended Job for clusters
+`ac-test-man-1` through `ac-test-man-100`. `full-1-100.env` pins the 26-week
+window with `BASE_EPOCH_OVERRIDE=1792800000`, seven direct generators and seven
+upload slots. Blocks use the flat layout for the downstream hub loader.
+
+Create the `thanosbench-full-1-100-settings` and `thanosbench-full-1-100-runner`
+ConfigMaps from `full-1-100.env` and `generate_and_publish.sh`, respectively.
+Stage the verified Linux binary at `/work/runner/thanosbench` on the new claim.
+Refresh the dedicated AWS Secret with `refresh-full-1-100-credentials.sh`,
+passing the intended `oc` context and namespace. The helper tries a prefix-scoped
+session by default. `AWS_SESSION_MODE=profile` uses the source profile's
+permissions and requires approval for that wider access. The startup check
+requires at least eight hours left on the session.
+
+The publisher pauses new generation when three weeks have failed uploads and
+drains the work already in flight. It retries the saved blocks in three bounded
+rounds with 30-second and 60-second waits before rounds two and three. It resumes
+generation after the backlog clears or exits with checkpoints on the PVC if
+failures persist. Preserve the PVC and S3 folder when restarting the Job.
+
 ## Resume an existing run
 
 For a migration, stop the original runner and wait for its uploads to exit.
