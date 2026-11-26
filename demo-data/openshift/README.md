@@ -43,7 +43,8 @@ PVC. The generator starts as soon as the transfer succeeds.
 oc -n "$NS" wait --for='jsonpath={.status.initContainerStatuses[0].state.running.startedAt}' \
   --timeout=2m pod -l job-name=thanosbench-pilot
 bash demo-data/openshift/stage.sh "$NS" /tmp/thanosbench-linux-amd64
-oc -n "$NS" logs --pod-running-timeout=2m -f job/thanosbench-pilot -c generate
+oc -n "$NS" wait --for=condition=Ready --timeout=2m pod -l job-name=thanosbench-pilot
+oc -n "$NS" logs -f job/thanosbench-pilot -c generate
 ```
 
 The pilot generates 54 blocks for one cluster over six weeks at 160,264 series
