@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate right-sizing blocks one cluster-week at a time and publish each to S3
+# Generate right-sizing blocks by cluster-week and publish each to S3
 # while the next one generates, so the whole run needs only a few GB of local
 # disk and takes about half the wall time of generate-then-upload.
 #
@@ -13,8 +13,8 @@
 # with index/chunks first and meta.json last (so a reader never sees a partial
 # block), verify all meta.json objects exist, optionally copy the blocks
 # server-side into HUB_PREFIX, write WORK/state/<cluster>.w<week>.done, and
-# delete the local copy. Generation pauses while MAX_INFLIGHT cluster-weeks are
-# still uploading. manifest.json is written to SHARED_PREFIX last, as the
+# delete the local copy. GEN_PARALLEL enables multiple generators, with a
+# separate MAX_INFLIGHT upload limit. manifest.json is written to SHARED_PREFIX last, as the
 # completion marker the validators read.
 #
 # Resumable: re-running skips finished cluster-weeks. BASE_EPOCH is pinned in
@@ -39,7 +39,8 @@ NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-154}"
 NUM_NODES="${NUM_NODES:-0}"
 NUM_NODE_METRICS="${NUM_NODE_METRICS:-0}"
 WORKERS="${WORKERS:-8}"
-MAX_INFLIGHT="${MAX_INFLIGHT:-3}"                    # cluster-weeks on local disk at once (~1 GB each)
+GEN_PARALLEL="${GEN_PARALLEL:-1}"                    # concurrent cluster-week generators
+MAX_INFLIGHT="${MAX_INFLIGHT:-3}"                    # concurrent cluster-week uploads
 UPLOAD_BLOCK_PARALLEL="${UPLOAD_BLOCK_PARALLEL:-3}"  # blocks of one cluster-week uploaded at once; a single
                                                      # stream to S3 tops out near 3.6 MB/s regardless of its
                                                      # own concurrency, so throughput comes from more streams
@@ -69,10 +70,10 @@ GEN_SECONDS_PER_CLUSTER_WEEK="${GEN_SECONDS_PER_CLUSTER_WEEK:-90}"   # measured 
 DS_5M_RATIO="${DS_5M_RATIO:-3.8}"; DS_1H_RATIO="${DS_1H_RATIO:-1.1}"
 
 # ---- validation --------------------------------------------------------------
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS NUM_NODES NUM_NODE_METRICS MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS NUM_NODES NUM_NODE_METRICS GEN_PARALLEL MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 1; }
 done
-[[ "$WEEKS" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
+[[ "$WEEKS" -ge 1 && "$GEN_PARALLEL" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS, GEN_PARALLEL and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
 [[ "$UPLOAD_BLOCK_PARALLEL" -ge 1 ]] || { echo "ABORT: UPLOAD_BLOCK_PARALLEL must be >= 1." >&2; exit 1; }
 for p in BUCKET SHARED_PREFIX; do
   [[ -n "${!p}" ]] || { echo "ABORT: $p is required." >&2; exit 1; }
@@ -106,8 +107,9 @@ BLOCKS=$(( TOTAL_CW * BLOCKS_PER_WEEK ))
 CW_BYTES=$(python3 -c "print(int(($RS_SPB*96*$BYTES_PER_SAMPLE+$FILLER_SPB*288*$FILLER_BYTES_PER_SAMPLE)*7))")
 PROJ_GB=$(python3 -c "print('%.1f'%($CW_BYTES*$TOTAL_CW/1e9))")
 HUB_GB=$(python3 -c "print('%.1f'%($CW_BYTES*$TOTAL_CW*(1+$DS_5M_RATIO+$DS_1H_RATIO)/1e9))")
-LOCAL_GB=$(python3 -c "print('%.1f'%($CW_BYTES*($MAX_INFLIGHT+1)/1e9))")
-GEN_H=$(python3 -c "print('%.1f'%($TOTAL_CW*$GEN_SECONDS_PER_CLUSTER_WEEK/3600))")
+LOCAL_GB=$(python3 -c "print('%.1f'%($CW_BYTES*min($TOTAL_CW,$MAX_INFLIGHT+$GEN_PARALLEL)/1e9))")
+GEN_BATCHES=$(( (TOTAL_CW + GEN_PARALLEL - 1) / GEN_PARALLEL ))
+GEN_H=$(python3 -c "print('%.2f'%($GEN_BATCHES*$GEN_SECONDS_PER_CLUSTER_WEEK/3600))")
 
 NODE_PARAMS=""
 if [[ "$NUM_NODES" != "0" || "$NUM_NODE_METRICS" != "0" ]]; then
@@ -136,7 +138,7 @@ else
   echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
 fi
 echo "  projected:    ~$PROJ_GB GB to upload; ~$HUB_GB GB on the hub after downsampling; peak local disk ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
-echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week; uploads overlap with generation"
+echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week with $GEN_PARALLEL generator(s); uploads overlap with generation"
 echo "  uploads:      $MAX_INFLIGHT cluster-week(s) in flight x $UPLOAD_BLOCK_PARALLEL parallel block(s) = up to $(( MAX_INFLIGHT * UPLOAD_BLOCK_PARALLEL )) concurrent S3 streams"
 echo "  retries:      $UPLOAD_RETRY_ROUNDS end-of-run upload round(s); retry backoff starts at ${UPLOAD_RETRY_DELAY_SECONDS}s"
 python3 -c "import sys; sys.exit(0 if $SPB > 5000000 else 1)" && { echo "ABORT: $SPB series/block > maxSeriesPerBlock=5,000,000." >&2; exit 1; }
@@ -186,19 +188,20 @@ shared_prefix_for() { # $1=cluster
 }
 
 generate_cw() { # $1=cluster $2=week $3=dir
-  local cluster="$1" w="$2" dir="$3" maxt gauges
+  local cluster="$1" w="$2" dir="$3" maxt gauges ulids
   maxt="$(iso $(( BASE_EPOCH - w*7*86400 )))"
   gauges="$(awk -v s="${RANDOM}${w}" 'BEGIN{srand(s);printf "%.3f %.3f",2.1+rand()*2.5,10.6+rand()*9.2}')"
-  rm -rf "$dir"; mkdir -p "$dir"
+  rm -rf "$dir" && mkdir -p "$dir" || return 1
   ( cd "$dir" && NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
       NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS \
       NUM_NODES=$NUM_NODES NUM_NODE_METRICS=$NUM_NODE_METRICS \
       MIN_GAUGE="${gauges% *}" MAX_GAUGE="${gauges#* }" \
       "$TB" block plan -p "$PROFILE" --labels "cluster=\"$cluster\"" --labels "aggregation=\"1d\"" --max-time "$maxt" \
-      | "$TB" block gen --output.dir "$dir" --workers "$WORKERS" ) > "$WORK/log/$cluster-w$w.gen.log" 2>&1
-  rm -rf "$dir/chunks_head"
+      | "$TB" block gen --output.dir "$dir" --workers "$WORKERS" ) > "$WORK/log/$cluster-w$w.gen.log" 2>&1 || return 1
+  rm -rf "$dir/chunks_head" || return 1
   [[ "$(complete_blocks_in "$dir")" -eq "$BLOCKS_PER_WEEK" ]] || { echo "ABORT: $cluster week $w produced $(complete_blocks_in "$dir") complete blocks, expected $BLOCKS_PER_WEEK (see $WORK/log/$cluster-w$w.gen.log)." >&2; return 1; }
-  ulids_in "$dir" > "$WORK/state/$cluster.w$w.ulids"
+  ulids="$WORK/state/$cluster.w$w.ulids"
+  ulids_in "$dir" > "$ulids.tmp" && mv "$ulids.tmp" "$ulids"
 }
 
 # NOTE: bash ignores `set -e` inside the left side of `||`/`&&`, inside `if` and
@@ -284,6 +287,68 @@ inflight() {
 count_state() { find "$WORK/state" -maxdepth 1 -name "*.$1" | wc -l | tr -d ' '; }   # $1 = done | failed | ulids
 wait_for_slot() { while [[ "$(inflight)" -ge "$MAX_INFLIGHT" ]]; do sleep 5; done; }
 
+generate_and_queue() { # $1=ordinal $2=cluster $3=week
+  local t0=$SECONDS
+  if ! generate_cw "$2" "$3" "$WORK/tmp/$2-w$3"; then
+    echo "== generation of $2 week $3 failed (see $WORK/log/$2-w$3.gen.log) ==" >&2
+    return 1
+  fi
+  log "[$1/$TOTAL_CW] $2 week $3 generated in $(( SECONDS-t0 ))s; queued for upload"
+}
+
+parallel_generate_and_publish() {
+  local cluster w task ordinal=0 total=0 next=0 ready_head=0 ready_end=0
+  local generating=0 uploading=0 failed=0
+  local clusters=() weeks=() ordinals=() ready=() generation_pid=() upload_pid=()
+  for cluster in $CLUSTERS; do
+    for (( w = 0; w < WEEKS; w++ )); do
+      ordinal=$((ordinal+1))
+      [[ -f "$WORK/state/$cluster.w$w.done" || -f "$WORK/state/$cluster.w$w.ulids" ]] && continue
+      clusters[total]=$cluster; weeks[total]=$w; ordinals[total]=$ordinal
+      total=$((total+1))
+    done
+  done
+
+  # Reap Bash child jobs without wait -n (unavailable on macOS Bash 3.2).
+  # Limit generated-but-unpublished data as well as the two worker pools.
+  while (( (next < total && !failed) || generating || uploading || ready_head < ready_end )); do
+    for task in "${!upload_pid[@]}"; do
+      kill -0 "${upload_pid[task]}" 2>/dev/null && continue
+      wait "${upload_pid[task]}" || failed=1
+      unset 'upload_pid[task]'
+      uploading=$((uploading-1))
+    done
+    for task in "${!generation_pid[@]}"; do
+      kill -0 "${generation_pid[task]}" 2>/dev/null && continue
+      if wait "${generation_pid[task]}"; then
+        ready[ready_end]=$task
+        ready_end=$((ready_end+1))
+      else
+        failed=1
+      fi
+      unset 'generation_pid[task]'
+      generating=$((generating-1))
+    done
+    while (( uploading < MAX_INFLIGHT && ready_head < ready_end )); do
+      task=${ready[ready_head]}; cluster=${clusters[task]}; w=${weeks[task]}
+      publish_cw "$cluster" "$w" "$WORK/tmp/$cluster-w$w" &
+      upload_pid[task]=$!
+      ready_head=$((ready_head+1)); uploading=$((uploading+1))
+    done
+    while (( !failed && next < total && generating < GEN_PARALLEL &&
+             generating + uploading + ready_end - ready_head < GEN_PARALLEL + MAX_INFLIGHT )); do
+      generate_and_queue "${ordinals[next]}" "${clusters[next]}" "${weeks[next]}" &
+      generation_pid[next]=$!
+      next=$((next+1)); generating=$((generating+1))
+    done
+    if (( generating || uploading )); then sleep 1; fi
+  done
+  if (( failed )); then
+    echo "== worker failed; re-run the same command to resume ==" >&2
+    return 1
+  fi
+}
+
 # bash 3.2 has no BASHPID, so a background subshell cannot name itself to
 # `pkill -P` -- under `set -u` such a trap dies on the unbound variable and the
 # aws processes outlive the run, still writing to S3 while the next run resumes.
@@ -357,6 +422,10 @@ retry_failed_uploads() {
   done
 }
 
+trap 'trap - INT TERM; echo; log "interrupted: stopping workers (re-run the same command to resume)"; kill_descendants $$; wait; exit 130' INT TERM
+
+# Clear stale failures before launching resume uploads, so new failures survive.
+find "$WORK/state" -maxdepth 1 -name '*.failed' -delete
 # resume: a tmp dir without a .ulids file is an interrupted generation; nothing of it is in S3
 for d in "$WORK"/tmp/*/; do
   [[ -d "$d" ]] || continue
@@ -392,26 +461,34 @@ for f in "$WORK"/state/*.ulids; do
     rm -f "$f"; rm -rf "$dir"
   fi
 done
-find "$WORK/state" -maxdepth 1 -name '*.failed' -delete
+
+generate_serially() {
+  local i=0 cluster w dir t0
+  for cluster in $CLUSTERS; do
+    for (( w = 0; w < WEEKS; w++ )); do
+      i=$((i+1))
+      [[ -f "$WORK/state/$cluster.w$w.done" ]] && continue
+      [[ -f "$WORK/state/$cluster.w$w.ulids" ]] && continue   # being re-uploaded by the resume step
+      wait_for_slot
+      dir="$WORK/tmp/$cluster-w$w"; t0=$(date +%s)
+      if ! generate_cw "$cluster" "$w" "$dir"; then
+        echo "== generation of $cluster week $w failed; waiting for in-flight uploads, then stopping. Re-run the same command to resume. ==" >&2
+        wait; exit 1
+      fi
+      publish_cw "$cluster" "$w" "$dir" &
+      log "[$i/$TOTAL_CW] $cluster week $w generated in $(( $(date +%s)-t0 ))s; uploading (in flight: $(inflight)); done so far: $(count_state "done")"
+    done
+  done
+}
 
 # ---- main loop ---------------------------------------------------------------
-trap 'trap - INT TERM; echo; log "interrupted: stopping uploads (re-run the same command to resume)"; kill_descendants $$; wait; exit 130' INT TERM
-START=$(date +%s); i=0
-for cluster in $CLUSTERS; do
-  for (( w = 0; w < WEEKS; w++ )); do
-    i=$((i+1))
-    [[ -f "$WORK/state/$cluster.w$w.done" ]] && continue
-    [[ -f "$WORK/state/$cluster.w$w.ulids" ]] && continue   # being re-uploaded by the resume step
-    wait_for_slot
-    dir="$WORK/tmp/$cluster-w$w"; t0=$(date +%s)
-    if ! generate_cw "$cluster" "$w" "$dir"; then
-      echo "== generation of $cluster week $w failed; waiting for in-flight uploads, then stopping. Re-run the same command to resume. ==" >&2
-      wait; exit 1
-    fi
-    publish_cw "$cluster" "$w" "$dir" &
-    log "[$i/$TOTAL_CW] $cluster week $w generated in $(( $(date +%s)-t0 ))s; uploading (in flight: $(inflight)); done so far: $(count_state "done")"
-  done
-done
+START=$(date +%s)
+if (( GEN_PARALLEL == 1 )); then
+  generate_serially
+else
+  wait  # finish the bounded resume uploads before opening the parallel queues
+  parallel_generate_and_publish
+fi
 wait
 retry_failed_uploads
 

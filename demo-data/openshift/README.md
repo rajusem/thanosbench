@@ -21,7 +21,8 @@ eight CPUs and 32 GiB of memory and sets a 16 GiB Go memory target within its
 
 ```bash
 NS=thanosbench-pilot
-PILOT_PREFIX=thanosbench/your-name-pilot-$(date -u +%Y%m%d-%H%M%S)
+TEST_ROOT=thanosbench/your-name-tests
+PILOT_PREFIX="$TEST_ROOT/short-6w"
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
   -o /tmp/thanosbench-linux-amd64 ./cmd/thanosbench
@@ -50,6 +51,19 @@ oc -n "$NS" logs -f job/thanosbench-pilot -c generate
 The pilot generates 54 blocks for one cluster over six weeks at 160,264 series
 per block. Compare the `generated in` timings and the elapsed time through the
 final S3 manifest. The short run includes ramp-up and the final upload drain.
+
+## Full 26-week pilot
+
+Use a sibling folder such as `$TEST_ROOT/full-26w-7way` for the full pilot.
+Set `WEEKS=26`, `GEN_PARALLEL=7`, and `MAX_INFLIGHT=7` in its configuration.
+Each generation worker keeps `WORKERS=8`. The seven-way RDU2 Job requests 56
+CPUs and 224 GiB of RAM, with a 256 GiB container memory limit. Give the test
+its own Job and settings ConfigMap and its own `WORK` directory on the PVC.
+
+`GEN_PARALLEL` defaults to one. With parallel generation, the runner bounds
+active generators and uploads separately. It stages at most `GEN_PARALLEL +
+MAX_INFLIGHT` active cluster-weeks, plus any failed uploads retained for retry.
+Keep the same S3 folder and work directory when resuming an interrupted test.
 
 ## Resume an existing run
 
