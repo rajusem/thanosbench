@@ -65,6 +65,10 @@ active generators and uploads separately. It stages at most `GEN_PARALLEL +
 MAX_INFLIGHT` active cluster-weeks, plus any failed uploads retained for retry.
 Keep the same S3 folder and work directory when resuming an interrupted test.
 
+Set `GEN_DIRECT=1` to generate from the same profile in one process. This
+requires a binary built with `block gen --profile` support. For a benchmark
+comparison, use `$TEST_ROOT/full-26w-direct-7way` and a separate `WORK` directory.
+
 ## Resume an existing run
 
 For a migration, stop the original runner and wait for its uploads to exit.

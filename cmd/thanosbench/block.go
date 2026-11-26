@@ -47,11 +47,14 @@ func registerBlock(m map[string]setupFunc, app *kingpin.Application) {
 	registerBlockPlan(m, cmd)
 }
 func registerBlockGen(m map[string]setupFunc, root *kingpin.CmdClause) {
-	cmd := root.Command("gen", "Generates Prometheus/Thanos TSDB blocks from input. Expects []blockgen.BlockSpec in YAML format as input.")
+	cmd := root.Command("gen", "Generates Prometheus/Thanos TSDB blocks from YAML input or a built-in profile.")
 	config := extflag.RegisterPathOrContent(cmd, "config", "YAML for  []blockgen.BlockSpec. Leave this empty in order to be able to pass this through STDIN", extflag.WithEnvSubstitution())
 	objStore := *extkingpin.RegisterCommonObjStoreFlags(cmd, "", false)
 	outputDir := cmd.Flag("output.dir", "Output directory for generated data.").Required().String()
 	workers := cmd.Flag("workers", "Number of go routines for block generation. If 0, 2*runtime.GOMAXPROCS(0) is used.").Int()
+	profile := cmd.Flag("profile", "Generate directly from a built-in profile.").Short('p').Enum(blockgen.Profiles.Keys()...)
+	maxTime := model.TimeOrDuration(cmd.Flag("max-time", "Time anchor for the built-in profile.").Default("30m"))
+	extLset := cmd.Flag("labels", "External labels for the built-in profile.").PlaceHolder("<name>=\"<value>\"").Strings()
 	m["block gen"] = func(g *run.Group, logger log.Logger) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
@@ -85,27 +88,52 @@ func registerBlockGen(m map[string]setupFunc, root *kingpin.CmdClause) {
 			}
 
 			n := 0
+			generate := func(b blockgen.BlockSpec) error {
+				level.Info(logger).Log("msg", "generating block", "spec", printBlocks(b))
+				id, err := blockgen.Generate(ctx, logger, goroutines, *outputDir, b)
+				if err != nil {
+					return errors.Wrap(err, "generate")
+				}
+				n++
+				blockDir := path.Join(*outputDir, id.String())
+				level.Info(logger).Log("msg", "generated block", "path", blockDir, "count", n)
+				// The profile path constructs the next spec directly. Its block writer
+				// already forces a collection before initializing each new head.
+				if *profile == "" {
+					runtime.GC()
+				}
+				if upload {
+					if err := block.Upload(ctx, logger, bkt, blockDir, metadata.NoneFunc); err != nil {
+						return errors.Wrapf(err, "upload block %s", id)
+					}
+					level.Info(logger).Log("msg", "uploaded block to object storage", "path", blockDir)
+				}
+				return nil
+			}
+
+			if *profile != "" {
+				if len(cfg) > 0 {
+					return errors.New("--profile and --config are mutually exclusive")
+				}
+				lset, err := parseFlagLabels(*extLset)
+				if err != nil {
+					return err
+				}
+				if err := blockgen.Profiles[*profile](ctx, *maxTime, lset, generate); err != nil {
+					return err
+				}
+				level.Info(logger).Log("msg", "all blocks done", "count", n)
+				return ctx.Err()
+			}
+
 			if len(cfg) > 0 {
 				bs := []blockgen.BlockSpec{}
 				if err := yaml.UnmarshalStrict(cfg, &bs); err != nil {
 					return err
 				}
 				for _, b := range bs {
-					level.Info(logger).Log("msg", "generating block", "spec", printBlocks(b))
-					id, err := blockgen.Generate(ctx, logger, goroutines, *outputDir, b)
-					if err != nil {
-						return errors.Wrap(err, "generate")
-					}
-					n++
-					blockDir := path.Join(*outputDir, id.String())
-					level.Info(logger).Log("msg", "generated block", "path", blockDir, "count", n)
-					runtime.GC()
-
-					if upload {
-						if err := block.Upload(ctx, logger, bkt, blockDir, metadata.NoneFunc); err != nil {
-							return errors.Wrapf(err, "upload block %s", id)
-						}
-						level.Info(logger).Log("msg", "uploaded block to object storage", "path", blockDir)
+					if err := generate(b); err != nil {
+						return err
 					}
 				}
 				return ctx.Err()
@@ -123,22 +151,8 @@ func registerBlockGen(m map[string]setupFunc, root *kingpin.CmdClause) {
 				if err != nil {
 					return errors.Wrap(err, "decode")
 				}
-
-				level.Info(logger).Log("msg", "generating block", "spec", printBlocks(b))
-				id, err := blockgen.Generate(ctx, logger, goroutines, *outputDir, b)
-				if err != nil {
-					return errors.Wrap(err, "generate")
-				}
-				n++
-				blockDir := path.Join(*outputDir, id.String())
-				level.Info(logger).Log("msg", "generated block", "path", blockDir, "count", n)
-				runtime.GC()
-
-				if upload {
-					if err := block.Upload(ctx, logger, bkt, blockDir, metadata.NoneFunc); err != nil {
-						return errors.Wrapf(err, "upload block %s", id)
-					}
-					level.Info(logger).Log("msg", "uploaded block to object storage", "path", blockDir)
+				if err := generate(b); err != nil {
+					return err
 				}
 			}
 			return ctx.Err()

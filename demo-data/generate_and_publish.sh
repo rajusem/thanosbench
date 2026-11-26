@@ -40,6 +40,7 @@ NUM_NODES="${NUM_NODES:-0}"
 NUM_NODE_METRICS="${NUM_NODE_METRICS:-0}"
 WORKERS="${WORKERS:-8}"
 GEN_PARALLEL="${GEN_PARALLEL:-1}"                    # concurrent cluster-week generators
+GEN_DIRECT="${GEN_DIRECT:-0}"                        # plan and generate in one process
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"                    # concurrent cluster-week uploads
 UPLOAD_BLOCK_PARALLEL="${UPLOAD_BLOCK_PARALLEL:-3}"  # blocks of one cluster-week uploaded at once; a single
                                                      # stream to S3 tops out near 3.6 MB/s regardless of its
@@ -75,6 +76,7 @@ for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_M
 done
 [[ "$WEEKS" -ge 1 && "$GEN_PARALLEL" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS, GEN_PARALLEL and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
 [[ "$UPLOAD_BLOCK_PARALLEL" -ge 1 ]] || { echo "ABORT: UPLOAD_BLOCK_PARALLEL must be >= 1." >&2; exit 1; }
+[[ "$GEN_DIRECT" == 0 || "$GEN_DIRECT" == 1 ]] || { echo "ABORT: GEN_DIRECT must be 0 or 1." >&2; exit 1; }
 for p in BUCKET SHARED_PREFIX; do
   [[ -n "${!p}" ]] || { echo "ABORT: $p is required." >&2; exit 1; }
 done
@@ -189,15 +191,21 @@ shared_prefix_for() { # $1=cluster
 
 generate_cw() { # $1=cluster $2=week $3=dir
   local cluster="$1" w="$2" dir="$3" maxt gauges ulids
+  local plan_args=()
   maxt="$(iso $(( BASE_EPOCH - w*7*86400 )))"
   gauges="$(awk -v s="${RANDOM}${w}" 'BEGIN{srand(s);printf "%.3f %.3f",2.1+rand()*2.5,10.6+rand()*9.2}')"
   rm -rf "$dir" && mkdir -p "$dir" || return 1
-  ( cd "$dir" && NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
-      NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS \
-      NUM_NODES=$NUM_NODES NUM_NODE_METRICS=$NUM_NODE_METRICS \
-      MIN_GAUGE="${gauges% *}" MAX_GAUGE="${gauges#* }" \
-      "$TB" block plan -p "$PROFILE" --labels "cluster=\"$cluster\"" --labels "aggregation=\"1d\"" --max-time "$maxt" \
-      | "$TB" block gen --output.dir "$dir" --workers "$WORKERS" ) > "$WORK/log/$cluster-w$w.gen.log" 2>&1 || return 1
+  (
+    cd "$dir" || exit 1
+    export NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS NUM_NODES NUM_NODE_METRICS
+    export MIN_GAUGE="${gauges% *}" MAX_GAUGE="${gauges#* }"
+    plan_args=(-p "$PROFILE" --labels "cluster=\"$cluster\"" --labels 'aggregation="1d"' --max-time "$maxt")
+    if [[ "$GEN_DIRECT" == 1 ]]; then
+      "$TB" block gen "${plan_args[@]}" --output.dir "$dir" --workers "$WORKERS"
+    else
+      "$TB" block plan "${plan_args[@]}" | "$TB" block gen --output.dir "$dir" --workers "$WORKERS"
+    fi
+  ) > "$WORK/log/$cluster-w$w.gen.log" 2>&1 || return 1
   rm -rf "$dir/chunks_head" || return 1
   [[ "$(complete_blocks_in "$dir")" -eq "$BLOCKS_PER_WEEK" ]] || { echo "ABORT: $cluster week $w produced $(complete_blocks_in "$dir") complete blocks, expected $BLOCKS_PER_WEEK (see $WORK/log/$cluster-w$w.gen.log)." >&2; return 1; }
   ulids="$WORK/state/$cluster.w$w.ulids"
