@@ -3,6 +3,8 @@ package blockgen
 import (
 	"context"
 	"math"
+	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -27,38 +29,31 @@ type BlockWriter struct {
 	// dir is output directory, given to us as arg.
 	dir string
 
-	head *tsdb.Head
+	head    *tsdb.Head
+	headDir string
 }
 
-// NewTSDBBlockWriter create new TSDB block writer.
-//
-// The returned writer is generally not assumed to be thread-safe at the moment.
-// It is assumed for single use.
-//
-// The returned writer accumulates all series in memory until `Flush` is called.
-// The repeated pattern of writes and flushes is allowed e.g.:
-//
-//	for n < 1000 {
-//		// write a lot of stuff into memory
-//		w.Write()
-//		w.Write()
-//
-//		// write block to disk
-//		w.Flush()
-//  }
-//
-// The above loop will produce 1000 blocks on disk.
-//
-// Note that the writer will not check if the target directory exists or
-// contains anything at all. It is the caller's responsibility to
-// ensure that the resulting blocks do not overlap etc.
+// NewTSDBBlockWriter creates a single-use writer with its own temporary head.
+// The caller is responsible for ensuring that resulting blocks do not overlap.
 func NewTSDBBlockWriter(logger log.Logger, dir string) (*BlockWriter, error) {
+	dir = filepath.Clean(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, errors.Wrap(err, "create block output directory")
+	}
+	// A new head must not replay mmap chunks from a previously generated block.
+	// The profiles can generate blocks newest first, with decreasing timestamps.
+	headDir, err := os.MkdirTemp(dir, ".head-*")
+	if err != nil {
+		return nil, errors.Wrap(err, "create temporary TSDB head directory")
+	}
 	res := &BlockWriter{
-		logger: logger,
-		dir:    dir,
+		logger:  logger,
+		dir:     dir,
+		headDir: headDir,
 	}
 
 	if err := res.initHeadAndAppender(); err != nil {
+		_ = res.close()
 		return nil, err
 	}
 
@@ -78,11 +73,27 @@ func (w *BlockWriter) Flush() (ulid.ULID, error) {
 		return ulid.ULID{}, errors.Wrap(err, "writeHeadToDisk")
 	}
 
-	if err := w.head.Close(); err != nil {
-		return ulid.ULID{}, errors.Wrap(err, "close head")
+	if err := w.close(); err != nil {
+		return ulid.ULID{}, err
 	}
 
 	return id, nil
+}
+
+func (w *BlockWriter) close() error {
+	var headErr error
+	if w.head != nil {
+		headErr = w.head.Close()
+		w.head = nil
+	}
+	removeErr := os.RemoveAll(w.headDir)
+	if removeErr == nil {
+		w.headDir = ""
+	}
+	if headErr != nil {
+		return errors.Wrap(headErr, "close head")
+	}
+	return errors.Wrap(removeErr, "remove temporary TSDB head directory")
 }
 
 // initHeadAndAppender creates and initialises new head and appender.
@@ -99,6 +110,7 @@ func (w *BlockWriter) initHeadAndAppender() error {
 	// Since we don't have info about block size here, set it to large number.
 	opts := tsdb.DefaultHeadOptions()
 	opts.ChunkRange = durToMilis(9999 * time.Hour)
+	opts.ChunkDirRoot = w.headDir
 	h, err := tsdb.NewHead(nil, logger, nil, opts, nil)
 	if err != nil {
 		return errors.Wrap(err, "tsdb.NewHead")

@@ -103,6 +103,7 @@ func Generate(ctx context.Context, logger log.Logger, goroutines int, dir string
 	if err != nil {
 		return ulid.ULID{}, err
 	}
+	defer w.close()
 
 	extLset := block.Thanos.Labels
 	if extLset == nil {
